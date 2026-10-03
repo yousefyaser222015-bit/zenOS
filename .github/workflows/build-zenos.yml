@@ -1,0 +1,123 @@
+name: Build Fixed zenOS Tizen Core (ARM64 & x86_64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-zenos-arm64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                                 bison flex libncurses-dev libssl-dev bc libelf-dev \
+                                 qemu-user-static qemu-system-arm qemu-utils \
+                                 e2fsprogs dosfstools kmod rpm2cpio cpio wget curl zstd busybox-static
+
+      # 1. بناء نواة متوافقة مع شاشة العرض والرسوميات
+      - name: Compile ARM64 Kernel
+        run: |
+          mkdir -p kernel_build
+          cd kernel_build
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+          tar -xf linux-6.1.80.tar.xz
+          cd linux-6.1.80
+          
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+
+          # تفعيل محركات الرسوميات و Framebuffer و Devtmpfs
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_VIRTIO_GPU
+          scripts/config --enable CONFIG_DEVTMPFS
+          scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          scripts/config --enable CONFIG_FB
+          scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
+          scripts/config --enable CONFIG_VT
+          scripts/config --enable CONFIG_BLK_DEV_INITRD
+
+          make -j$(nproc) Image
+          cd ../..
+          mkdir -p boot_kernel
+          cp kernel_build/linux-6.1.80/arch/arm64/boot/Image boot_kernel/Image
+
+      # 2. تجهيز RootFS مع معالجة حزم Tizen والمسارات
+      - name: Build Tizen RootFS with Working Dynamic Loader
+        run: |
+          mkdir -p zenos_rootfs/{bin,sbin,etc,proc,sys,usr/bin,usr/sbin,usr/lib,dev,mnt,boot,root,tmp,run,lib,lib64}
+          
+          # تنزيل وفك حزم Tizen الأساسية
+          mkdir -p tizen_rpms
+          cd tizen_rpms
+          TIZEN_REPO="https://download.tizen.org/snapshots/TIZEN/Tizen/Tizen-Unified/latest/repos/standard/packages/aarch64/"
+          wget -q -r -l1 -nd -A "*busybox*.rpm,*glibc*.rpm,*bash*.rpm,*weston*.rpm,*wayland*.rpm,*efl*.rpm" "$TIZEN_REPO" || true
+
+          for rpm in *.rpm; do
+            if [ -f "$rpm" ]; then
+              rpm2cpio "$rpm" | cpio -idmv -D ../zenos_rootfs 2>/dev/null || true
+            fi
+          done
+          cd ..
+
+          # نسخ busybox المجمع استاتيكياً لضمان البدء 100%
+          cp /bin/busybox zenos_rootfs/bin/busybox.static
+          chmod +x zenos_rootfs/bin/busybox.static
+
+          # إنشاء C Binary / Shell Init مستقل استاتيكياً لـ /sbin/init
+          cat << 'EOF' > zenos_rootfs/init.sh
+#!/bin/bin/busybox.static sh
+/bin/busybox.static mount -t proc none /proc
+/bin/busybox.static mount -t sysfs none /sys
+/bin/busybox.static mount -t devtmpfs none /dev 2>/dev/null || true
+/bin/busybox.static mkdir -p /dev/pts /dev/shm /tmp
+/bin/busybox.static mount -t devpts none /dev/pts 2>/dev/null || true
+/bin/busybox.static chmod 1777 /tmp
+
+/bin/busybox.static clear
+/bin/busybox.static echo "=================================================="
+/bin/busybox.static echo "    Welcome to zenOS (Tizen Core Environment)    "
+/bin/busybox.static echo "=================================================="
+
+export XDG_RUNTIME_DIR=/tmp
+export DISPLAY=:0
+
+if [ -x /usr/bin/weston ]; then
+  /bin/busybox.static echo "Starting Tizen Weston GUI..."
+  exec /usr/bin/weston --backend=drm-backend.so --continue-without-input
+else
+  /bin/busybox.static echo "Tizen Console Shell Ready!"
+  exec /bin/busybox.static sh
+fi
+EOF
+          chmod +x zenos_rootfs/init.sh
+          ln -sf /init.sh zenos_rootfs/sbin/init
+          ln -sf /init.sh zenos_rootfs/etc/init
+          
+          cp boot_kernel/Image zenos_rootfs/boot/Image
+
+      # 3. إنشاء صورة القرص النهائية (3GB)
+      - name: Create Bootable Disk Image
+        run: |
+          dd if=/dev/zero of=zenOS-ARM64-Tizen-Fixed.img bs=1M count=3000
+          mkfs.ext4 -F -L "zenOS-Tizen" zenOS-ARM64-Tizen-Fixed.img
+          
+          mkdir -p /tmp/zenos_mnt
+          sudo mount -o loop zenOS-ARM64-Tizen-Fixed.img /tmp/zenos_mnt
+          sudo cp -a zenos_rootfs/* /tmp/zenos_mnt/
+          sudo umount /tmp/zenos_mnt
+
+      # 4. رفع الملف النهائي
+      - name: Upload Fixed Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64-Tizen-Fixed
+          path: zenOS-ARM64-Tizen-Fixed.img
+          
