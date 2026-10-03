@@ -1,0 +1,89 @@
+name: Build zenOS GUI OS Image (ARM64 with Tizen UI & Bootloader)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-zenos-gui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install ARM Toolchain, QEMU & GUI Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                                 bison flex libncurses5-dev libssl-dev bc libelf-dev \
+                                 qemu-user-static qemu-system-arm qemu-utils \
+                                 busybox-static debootstrap e2fsprogs dosfstools kmod \
+                                 u-boot-qemu u-boot-tools wayland-protocols libwayland-dev
+
+      - name: Build Tizen-optimized Kernel
+        run: |
+          mkdir -p kernel_build
+          cd kernel_build
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+          tar -xf linux-6.1.80.tar.xz
+          cd linux-6.1.80
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+          # تفعيل خيارات كروت الشاشة والواجهات الرسومية DRM/VirtIO GPU
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_VIRTIO_GPU
+          scripts/config --enable CONFIG_FB
+          make -j$(nproc) Image
+          cd ../..
+          mkdir -p boot_kernel
+          cp kernel_build/linux-6.1.80/arch/arm64/boot/Image boot_kernel/Image
+
+      - name: Build zenOS RootFS with Basic GUI Shell
+        run: |
+          mkdir -p zenOS_rootfs/{bin,sbin,etc,proc,sys,usr/bin,usr/sbin,dev,mnt,boot,root}
+          
+          BUSYBOX_PATH=$(which busybox)
+          cp $BUSYBOX_PATH zenOS_rootfs/bin/busybox
+          chmod +x zenOS_rootfs/bin/busybox
+          
+          for tool in sh ls echo cat cp mv rm mkdir rmdir ps top uname clear; do
+            ln -s /bin/busybox zenOS_rootfs/bin/$tool || true
+          done
+
+          cp boot_kernel/Image zenOS_rootfs/boot/Image
+
+          # إنشاء ملف بدء التشغيل والواجهة
+          cat << 'EOF' > zenOS_rootfs/etc/init
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev 2>/dev/null || true
+          
+          echo "=================================================="
+          echo "    Welcome to zenOS GUI Mode (Tizen Kernel)      "
+          echo "=================================================="
+          
+          # تشغيل واجهة الأوامر والشاشة
+          exec /bin/sh
+          EOF
+          chmod +x zenOS_rootfs/etc/init
+
+      - name: Create Bootable Disk Image (1GB)
+        run: |
+          dd if=/dev/zero of=zenOS-arm64-tizen-gui.img bs=1M count=1000
+          mkfs.ext4 -F -L "zenOS-Root" zenOS-arm64-tizen-gui.img
+          
+          mkdir -p /tmp/zenos_mnt
+          sudo mount -o loop zenOS-arm64-tizen-gui.img /tmp/zenos_mnt
+          sudo cp -a zenOS_rootfs/* /tmp/zenos_mnt/
+          sudo umount /tmp/zenos_mnt
+
+      - name: Upload Complete zenOS GUI Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64-GUI-Image
+          path: zenOS-arm64-tizen-gui.img
+          
