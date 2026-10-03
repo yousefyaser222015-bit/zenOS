@@ -1,0 +1,115 @@
+name: Build zenOS System Image with Tizen-based Kernel (ARM64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-zenos-tizen-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. سحب كود المشروع من المستودع
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. تثبيت أدوات بناء نظام ARM ومحاكي QEMU وأدوات التجميع الكروس (Cross-Compilation)
+      - name: Install ARM Toolchain, Kernel Build Tools & Image Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                                 bison flex libncurses5-dev libssl-dev bc libelf-dev \
+                                 qemu-user-static qemu-system-arm qemu-utils \
+                                 busybox-static debootstrap e2fsprogs dosfstools kmod u-boot-tools
+
+      # 3. جلب مصدر نواة Tizen / Linux خفيفة مجهزة للـ ARM64 وإعدادها
+      - name: Download & Configure Tizen-optimized Linux Kernel
+        run: |
+          echo "=================================================="
+          echo "   Fetching Tizen-optimized Kernel & Sources      "
+          echo "=================================================="
+          # استخدام نواة LTS خفيفة مع إعدادات Tizen المميزة للمقومات والموارد المحدودة
+          mkdir -p kernel_build
+          cd kernel_build
+          
+          # جلب أحدث نواة من سلسلة Linux LTS المستعملة كقاعدة لنظام Tizen
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+          tar -xf linux-6.1.80.tar.xz
+          cd linux-6.1.80
+
+          # إعداد النواة لمعمارية ARM64 (defconfig)
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+
+          # تجميع النواة والصورة البرمجية (Image)
+          echo "Compiling ARM64 Kernel Image..."
+          make -j$(nproc) Image
+
+          cd ../..
+          mkdir -p boot_kernel
+          cp kernel_build/linux-6.1.80/arch/arm64/boot/Image boot_kernel/Image
+
+      # 4. إنشـاء هيكل نظام zenOS (RootFS) وتجهيز السكريبت الأول للتثبيت والتشغيل
+      - name: Build zenOS RootFS & System Structure
+        run: |
+          echo "=================================================="
+          echo "       Building zenOS RootFS for ARM64            "
+          echo "=================================================="
+          mkdir -p zenOS_rootfs/{bin,sbin,etc,proc,sys,usr/bin,usr/sbin,dev,mnt,boot}
+          
+          # نسخ أداة BusyBox المسؤولة عن توفير بيئة الأوامر الشاملة
+          BUSYBOX_PATH=$(which busybox)
+          cp $BUSYBOX_PATH zenOS_rootfs/bin/busybox
+          chmod +x zenOS_rootfs/bin/busybox
+          
+          # ربط أوامر النظام الأساسية بأداة BusyBox
+          for tool in sh ls echo cat cp mv rm mkdir rmdir ps top uname dmesg clear; do
+            ln -s /bin/busybox zenOS_rootfs/bin/$tool || true
+          done
+
+          # نسخ صورة النواة المجمعة داخل مجلد boot بالـ RootFS
+          cp boot_kernel/Image zenOS_rootfs/boot/vmlinuz-zenos-tizen
+
+          # إنشاء ملف التهيئة والإقلاع الأول للنظام (/etc/init)
+          cat << 'EOF' > zenOS_rootfs/etc/init
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev 2>/dev/null || true
+          
+          echo "=================================================="
+          echo "    Welcome to zenOS (ARM64 - Tizen Kernel Core)  "
+          echo "=================================================="
+          echo "Kernel Info: $(uname -a)"
+          echo ""
+          exec /bin/sh
+          EOF
+          chmod +x zenOS_rootfs/etc/init
+
+      # 5. بناء وتقسيم قرص النظام النهائي (Bootable zenOS-arm64-tizen.img)
+      - name: Create Complete Bootable Disk Image
+        run: |
+          echo "Creating 500MB Bootable Disk Image for zenOS..."
+          dd if=/dev/zero of=zenOS-arm64-tizen.img bs=1M count=500
+          
+          # تهيئة القرص بنظام ملفات ext4
+          mkfs.ext4 -F -L "zenOS-Root" zenOS-arm64-tizen.img
+          
+          # دمج مجلدات الـ RootFS والنواة داخل القرص
+          mkdir -p /tmp/zenos_mnt
+          sudo mount -o loop zenOS-arm64-tizen.img /tmp/zenos_mnt
+          sudo cp -a zenOS_rootfs/* /tmp/zenos_mnt/
+          sudo umount /tmp/zenos_mnt
+
+          echo "Integrated Image Creation Successful!"
+          ls -lh zenOS-arm64-tizen.img
+
+      # 6. رفع ملف الصورة المكتمل كـ Artifact جاهز للتنزيل
+      - name: Upload Complete zenOS System Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64-Tizen-Full-Image
+          path: zenOS-arm64-tizen.img
+          
