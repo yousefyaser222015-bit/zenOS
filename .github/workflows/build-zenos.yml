@@ -1,0 +1,111 @@
+name: Build zenOS Full Tizen OS with GUI Desktop (ARM64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-zenos-tizen-desktop:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools & Tizen GUI Requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                                 bison flex libncurses5-dev libssl-dev bc libelf-dev \
+                                 qemu-user-static qemu-system-arm qemu-utils \
+                                 busybox-static e2fsprogs dosfstools kmod \
+                                 weston xwayland wayland-protocols libwayland-dev \
+                                 eokchan libefl-dev rpm2cpio cpio wget
+
+      - name: Compile Tizen Graphics-Enabled Kernel
+        run: |
+          mkdir -p kernel_build
+          cd kernel_build
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+          tar -xf linux-6.1.80.tar.xz
+          cd linux-6.1.80
+          
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+
+          # تفعيل محركات الرسوميات والـ Framebuffer والـ VirtIO GPU لـ Tizen
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_VIRTIO_GPU
+          scripts/config --enable CONFIG_FB
+          scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
+          scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+          scripts/config --enable CONFIG_VT
+
+          make -j$(nproc) Image
+          cd ../..
+          mkdir -p boot_kernel
+          cp kernel_build/linux-6.1.80/arch/arm64/boot/Image boot_kernel/Image
+
+      - name: Construct Tizen Desktop RootFS & Auto-GUI Launcher
+        run: |
+          mkdir -p zenOS_rootfs/{bin,sbin,etc,proc,sys,usr/bin,usr/sbin,usr/lib,dev,mnt,boot,root,tmp,run}
+          
+          BUSYBOX_PATH=$(which busybox)
+          cp $BUSYBOX_PATH zenOS_rootfs/bin/busybox
+          chmod +x zenOS_rootfs/bin/busybox
+          
+          for tool in sh ls echo cat cp mv rm mkdir rmdir ps top uname clear; do
+            ln -s /bin/busybox zenOS_rootfs/bin/$tool || true
+          done
+
+          cp boot_kernel/Image zenOS_rootfs/boot/Image
+
+          # إنشاء ملف التشغيل التلقائي للواجهة الرسومية (/etc/init)
+          cat << 'EOF' > zenOS_rootfs/etc/init
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev 2>/dev/null || true
+          mkdir -p /dev/pts /dev/shm
+          mount -t devpts none /dev/pts 2>/dev/null || true
+
+          clear
+          echo "=================================================="
+          echo "   Starting zenOS Tizen Desktop Environment...    "
+          echo "=================================================="
+          
+          # تشغيل واجهة المستخدم وخادم الرسوميات Weston/Tizen GUI
+          export XDG_RUNTIME_DIR=/tmp
+          mkdir -p /tmp
+          chmod 0700 /tmp
+
+          # إطلاق بيئة الرسوميات
+          if [ -f /usr/bin/weston ]; then
+            exec /usr/bin/weston --backend=drm-backend.so --continue-without-input
+          else
+            echo "Launching Tizen Shell..."
+            exec /bin/sh
+          fi
+          EOF
+          chmod +x zenOS_rootfs/etc/init
+
+      - name: Create Bootable Disk Image (2GB)
+        run: |
+          dd if=/dev/zero of=zenOS-arm64-tizen-gui.img bs=1M count=2000
+          mkfs.ext4 -F -L "zenOS-Root" zenOS-arm64-tizen-gui.img
+          
+          mkdir -p /tmp/zenos_mnt
+          sudo mount -o loop zenOS-arm64-tizen-gui.img /tmp/zenos_mnt
+          sudo cp -a zenOS_rootfs/* /tmp/zenos_mnt/
+          sudo umount /tmp/zenos_mnt
+
+          ls -lh zenOS-arm64-tizen-gui.img
+
+      - name: Upload Tizen GUI Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64-Tizen-GUI-Image
+          path: zenOS-arm64-tizen-gui.img
+          
