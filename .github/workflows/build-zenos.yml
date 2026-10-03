@@ -1,0 +1,194 @@
+name: Build Complete Tizen OS GUI & Runtime Engine (ARM64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-tizen-full-gui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Native Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                                 bison flex libncurses-dev libssl-dev bc libelf-dev \
+                                 qemu-user-static qemu-system-arm qemu-utils \
+                                 e2fsprogs dosfstools kmod rpm2cpio cpio wget curl zstd busybox-static
+
+      # 1. بناء نواة ARM64 مع تفعيل كروت الشاشة الافتراضية
+      - name: Compile DRM-Enabled Tizen Kernel
+        run: |
+          mkdir -p kernel_build
+          cd kernel_build
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+          tar -xf linux-6.1.80.tar.xz
+          cd linux-6.1.80
+          
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+
+          # تفعيل DRM و VirtIO GPU و FBDEV لتشغيل الواجهة الرسومية
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_VIRTIO_GPU
+          scripts/config --enable CONFIG_DRM_BOCHS
+          scripts/config --enable CONFIG_DEVTMPFS
+          scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          scripts/config --enable CONFIG_FB
+          scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
+          scripts/config --enable CONFIG_VT
+          scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+          scripts/config --enable CONFIG_INPUT_EVDEV
+
+          make -j$(nproc) Image
+          cd ../..
+          mkdir -p boot_kernel
+          cp kernel_build/linux-6.1.80/arch/arm64/boot/Image boot_kernel/Image
+
+      # 2. تحميل النظام القاعدي الكامل لـ Tizen وجميع حزم EFL و Tizen Core
+      - name: Fetch and Install Full Tizen Base & GUI Packages
+        run: |
+          mkdir -p zenos_rootfs/{bin,sbin,etc,proc,sys,usr/bin,usr/sbin,usr/lib,usr/libexec,dev,mnt,boot,root,tmp,run,lib,lib64,var/run}
+          mkdir -p tizen_rpms
+          cd tizen_rpms
+
+          TIZEN_REPO="https://download.tizen.org/snapshots/TIZEN/Tizen/Tizen-Unified/latest/repos/standard/packages/aarch64/"
+
+          echo "Fetching Tizen Repositories Index..."
+          curl -s "$TIZEN_REPO" | grep -oE 'href="[^"]+\.rpm"' | cut -d'"' -f2 > rpm_list.txt
+
+          echo "Filtering Essential Tizen Core, EFL, Weston, AUL, and GUI Packages..."
+          grep -E "glibc|busybox|bash|wayland|weston|efl|elementary|cairo|pixman|libdrm|dbus|systemd|vconf|aul|buxton|capi|tizen|libcore|enlightenment" rpm_list.txt > target_rpms.txt || true
+
+          echo "Downloading Filtered Tizen RPMs..."
+          while read -r rpm_file; do
+            if [ -n "$rpm_file" ]; then
+              wget -q -c "${TIZEN_REPO}${rpm_file}" -O "$rpm_file" || true
+            fi
+          done < target_rpms.txt
+
+          echo "Extracting all Tizen RPMs into RootFS..."
+          for rpm in *.rpm; do
+            if [ -f "$rpm" ] && [ -s "$rpm" ]; then
+              rpm2cpio "$rpm" | cpio -idmv -D ../zenos_rootfs 2>/dev/null || true
+            fi
+          done
+          cd ..
+
+          # توفير busybox لاستقرار الأوامر
+          cp /bin/busybox zenos_rootfs/bin/busybox.static
+          chmod +x zenos_rootfs/bin/busybox.static
+
+          # ربط المسارات الهيكلية ومكتبات Tizen
+          cd zenos_rootfs
+          [ -d lib64 ] || mkdir lib64
+          [ -d usr/lib64 ] && cp -a usr/lib64/* usr/lib/ 2>/dev/null || true
+          ln -sf /usr/lib/ld-linux-aarch64.so.1 lib/ld-linux-aarch64.so.1 2>/dev/null || true
+          ln -sf /usr/lib/ld-linux-aarch64.so.1 lib64/ld-linux-aarch64.so.1 2>/dev/null || true
+          
+          # إنشاء ملفات إعداد البيئة والـ Dynamic Linker
+          echo "/usr/lib" > etc/ld.so.conf
+          echo "/lib" >> etc/ld.so.conf
+          echo "/usr/local/lib" >> etc/ld.so.conf
+          cd ..
+
+      # 3. إعداد السكريبت المدمج لإجبار تشغيل بيئة Tizen GUI
+      - name: Setup Tizen GUI Startup Engine
+        run: |
+          cat << 'EOF' > zenos_rootfs/usr/bin/start-tizen-gui
+          #!/bin/sh
+          export XDG_RUNTIME_DIR=/run/user/0
+          export WAYLAND_DISPLAY=wayland-0
+          export DISPLAY=:0
+          export ELM_ENGINE=wayland_egl
+          export ELM_DISPLAY=wl
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          export LD_LIBRARY_PATH=/usr/lib:/lib
+
+          echo "[zenOS Engine] Registering Tizen Dynamic Libraries..."
+          /sbin/ldconfig 2>/dev/null || true
+
+          echo "[zenOS Engine] Starting D-Bus System Bus..."
+          dbus-uuidgen --ensure 2>/dev/null
+          dbus-daemon --system --fork 2>/dev/null
+
+          echo "[zenOS Engine] Launching Tizen Weston Display Server..."
+          if [ -x /usr/bin/weston ]; then
+              exec weston --backend=drm-backend.so --log=/tmp/weston.log
+          elif [ -x /usr/bin/enlightenment ]; then
+              exec enlightenment
+          elif [ -x /usr/bin/e_main ]; then
+              exec e_main
+          else
+              echo "[ERROR] Tizen GUI Binary not found! Starting fallback GUI demo..."
+              exec busybox.static sh
+          fi
+          EOF
+
+          chmod +x zenos_rootfs/usr/bin/start-tizen-gui
+
+      # 4. كتابة Init قوي يستدعي محرك Tizen GUI مباشرة
+      - name: Create Native Tizen C Init Tool
+        run: |
+          cat << 'EOF' > tizen_init.c
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <sys/mount.h>
+          #include <sys/stat.h>
+
+          int main() {
+              mount("proc", "/proc", "proc", 0, NULL);
+              mount("sysfs", "/sys", "sysfs", 0, NULL);
+              mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+              mkdir("/dev/pts", 0755);
+              mkdir("/dev/shm", 0755);
+              mkdir("/tmp", 0777);
+              mkdir("/run/user", 0755);
+              mkdir("/run/user/0", 0700);
+              mount("devpts", "/dev/pts", "devpts", 0, NULL);
+
+              printf("\n==================================================\n");
+              printf("  zenOS (Booting Tizen GUI & Runtime Platform)   \n");
+              printf("==================================================\n\n");
+
+              # Executing the Tizen GUI Launcher
+              system("/usr/bin/start-tizen-gui");
+
+              printf("\n[zenOS Fallback Shell Activated]\n");
+              execl("/bin/bash", "bash", NULL);
+              execl("/bin/busybox.static", "busybox.static", "sh", NULL);
+
+              while(1) { sleep(10); }
+              return 0;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc -static tizen_init.c -o zenos_rootfs/sbin/init
+          chmod +x zenos_rootfs/sbin/init
+          cp boot_kernel/Image zenos_rootfs/boot/Image
+
+      # 5. بناء قرص بالنظام المدمج بحجم 1.5GB (1500MB)
+      - name: Create 1.5GB System Image
+        run: |
+          dd if=/dev/zero of=zenOS-ARM64-Tizen-GUI.img bs=1M count=1500
+          mkfs.ext4 -F -L "zenOS-Tizen" zenOS-ARM64-Tizen-GUI.img
+          
+          mkdir -p /tmp/zenos_mnt
+          sudo mount -o loop zenOS-ARM64-Tizen-GUI.img /tmp/zenos_mnt
+          sudo cp -a zenos_rootfs/* /tmp/zenos_mnt/
+          sudo umount /tmp/zenos_mnt
+
+      # 6. رفع الملف النهائي
+      - name: Upload Tizen Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64-Tizen-GUI
+          path: zenOS-ARM64-Tizen-GUI.img
+          
