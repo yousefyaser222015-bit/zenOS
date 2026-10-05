@@ -1,0 +1,693 @@
+name: Build zenOS ARM64 Tizen Minimal
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      KVER: "6.1.80"
+      WORK: ${{ github.workspace }}/work
+      ROOTFS: ${{ github.workspace }}/work/rootfs
+      RPMDIR: ${{ github.workspace }}/work/rpms
+      UNIFIED: "https://download.tizen.org/snapshots/TIZEN/Tizen/Tizen-Unified/latest/repos/standard/packages"
+      BASE: "https://download.tizen.org/snapshots/TIZEN/Tizen/Tizen-Base/latest/repos/standard/packages"
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu bison flex \
+            libncurses-dev libssl-dev libelf-dev libdw-dev bc \
+            cpio rpm rpm2cpio dnf curl wget zip unzip \
+            xz-utils zstd e2fsprogs dosfstools \
+            qemu-system-arm qemu-utils qemu-user-static \
+            busybox-static
+
+          command -v dnf
+          command -v rpm2cpio
+          command -v cpio
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-system-aarch64
+
+      - name: Prepare
+        run: |
+          set -eux
+          rm -rf "$WORK"
+          mkdir -p "$WORK" "$ROOTFS" "$RPMDIR" \
+            "$WORK/mnt" "$WORK/dnf-cache" "$WORK/linux"
+
+      - name: Download kernel
+        run: |
+          set -eux
+          cd "$WORK"
+
+          curl -fL --retry 5 --retry-all-errors \
+            -o "linux-${KVER}.tar.xz" \
+            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz"
+
+          test -s "linux-${KVER}.tar.xz"
+
+      - name: Extract kernel
+        run: |
+          set -eux
+
+          rm -rf "$WORK/linux"
+          mkdir -p "$WORK/linux"
+
+          tar -xf "linux-${KVER}.tar.xz" \
+            --strip-components=1 \
+            -C "$WORK/linux"
+
+          test -f "$WORK/linux/Makefile"
+          test -f "$WORK/linux/Kconfig"
+          test -d "$WORK/linux/arch/arm64"
+
+      - name: Configure kernel
+        working-directory: ${{ env.WORK }}/linux
+        run: |
+          set -eux
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make defconfig
+
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+
+          ./scripts/config --enable CONFIG_VIRTIO
+          ./scripts/config --enable CONFIG_VIRTIO_PCI
+          ./scripts/config --enable CONFIG_VIRTIO_MMIO
+          ./scripts/config --enable CONFIG_VIRTIO_BLK
+          ./scripts/config --enable CONFIG_VIRTIO_NET
+          ./scripts/config --enable CONFIG_VIRTIO_INPUT
+          ./scripts/config --enable CONFIG_VIRTIO_CONSOLE
+
+          ./scripts/config --enable CONFIG_DRM
+          ./scripts/config --enable CONFIG_DRM_KMS_HELPER
+          ./scripts/config --enable CONFIG_DRM_VIRTIO_GPU
+          ./scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
+          ./scripts/config --enable CONFIG_FB
+          ./scripts/config --enable CONFIG_FB_SIMPLE
+          ./scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+
+          ./scripts/config --enable CONFIG_INPUT
+          ./scripts/config --enable CONFIG_INPUT_EVDEV
+          ./scripts/config --enable CONFIG_INPUT_MOUSE
+          ./scripts/config --enable CONFIG_INPUT_KEYBOARD
+
+          ./scripts/config --enable CONFIG_EXT4_FS
+          ./scripts/config --enable CONFIG_TMPFS
+          ./scripts/config --enable CONFIG_PROC_FS
+          ./scripts/config --enable CONFIG_SYSFS
+
+          ./scripts/config --enable CONFIG_NET
+          ./scripts/config --enable CONFIG_INET
+          ./scripts/config --enable CONFIG_PACKET
+          ./scripts/config --enable CONFIG_UNIX
+          ./scripts/config --enable CONFIG_NETDEVICES
+          ./scripts/config --enable CONFIG_IP_PNP
+          ./scripts/config --enable CONFIG_IP_PNP_DHCP
+
+          make olddefconfig
+
+      - name: Build kernel
+        working-directory: ${{ env.WORK }}/linux
+        run: |
+          set -eux
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make -j"$(nproc)" Image
+
+          test -s arch/arm64/boot/Image
+
+          cp arch/arm64/boot/Image "$WORK/Image"
+
+          ls -lh "$WORK/Image"
+
+      - name: Configure Tizen repositories
+        run: |
+          set -eux
+
+          cat > "$WORK/tizen.repo" <<EOF
+          [tizen-unified]
+          name=Tizen Unified ARM64
+          baseurl=$UNIFIED
+          enabled=1
+          gpgcheck=0
+          repo_gpgcheck=0
+          metadata_expire=3600
+          skip_if_unavailable=0
+
+          [tizen-base]
+          name=Tizen Base ARM64
+          baseurl=$BASE
+          enabled=1
+          gpgcheck=0
+          repo_gpgcheck=0
+          metadata_expire=3600
+          skip_if_unavailable=0
+          EOF
+
+          cat "$WORK/tizen.repo"
+
+      - name: Refresh Tizen metadata
+        run: |
+          set -eux
+
+          sudo dnf \
+            --releasever=latest \
+            --nogpgcheck \
+            --config="$WORK/tizen.repo" \
+            --setopt=cachedir="$WORK/dnf-cache" \
+            --setopt=metadata_expire=0 \
+            --setopt=skip_if_unavailable=False \
+            --forcearch=aarch64 \
+            makecache
+
+      - name: Download Tizen packages
+        run: |
+          set -eux
+
+          sudo dnf \
+            --releasever=latest \
+            --nogpgcheck \
+            --config="$WORK/tizen.repo" \
+            --setopt=cachedir="$WORK/dnf-cache" \
+            --setopt=keepcache=True \
+            --setopt=install_weak_deps=False \
+            --setopt=best=False \
+            --setopt=skip_if_unavailable=False \
+            --forcearch=aarch64 \
+            --downloadonly \
+            --downloaddir="$RPMDIR" \
+            install \
+            bash dbus dbus-libs wayland wayland-protocols weston \
+            libdrm mesa pixman cairo pango fontconfig freetype \
+            efl elementary ecore ecore-wayland evas eina \
+            aul app-core pkgmgr pkgmgr-info pkgmgr-server \
+            tizen-platform-config libinput libevdev curl openssl \
+            ca-certificates
+
+          sudo chown -R "$(id -u):$(id -g)" "$RPMDIR"
+
+          find "$RPMDIR" \
+            -type f -name '*.rpm' -size 0 -delete
+
+          COUNT=$(find "$RPMDIR" -type f -name '*.rpm' | wc -l)
+
+          echo "Downloaded RPMs: $COUNT"
+
+          test "$COUNT" -gt 0
+
+      - name: Create rootfs
+        run: |
+          set -eux
+
+          mkdir -p \
+            "$ROOTFS/bin" \
+            "$ROOTFS/sbin" \
+            "$ROOTFS/usr/bin" \
+            "$ROOTFS/usr/sbin" \
+            "$ROOTFS/usr/lib" \
+            "$ROOTFS/usr/lib64" \
+            "$ROOTFS/lib" \
+            "$ROOTFS/lib64" \
+            "$ROOTFS/etc" \
+            "$ROOTFS/etc/xdg/weston" \
+            "$ROOTFS/etc/dbus-1/system.d" \
+            "$ROOTFS/dev" \
+            "$ROOTFS/proc" \
+            "$ROOTFS/sys" \
+            "$ROOTFS/run" \
+            "$ROOTFS/run/user/0" \
+            "$ROOTFS/tmp" \
+            "$ROOTFS/root" \
+            "$ROOTFS/home" \
+            "$ROOTFS/opt" \
+            "$ROOTFS/var/log" \
+            "$ROOTFS/var/run" \
+            "$ROOTFS/var/cache"
+
+      - name: Extract RPMs
+        run: |
+          set -eux
+
+          cd "$RPMDIR"
+
+          for rpm in ./*.rpm; do
+            [ -f "$rpm" ] || continue
+
+            echo "Extracting $(basename "$rpm")"
+
+            rpm2cpio "$rpm" | \
+              (cd "$ROOTFS" && cpio -idm --quiet)
+          done
+
+          du -sh "$ROOTFS"
+
+      - name: Install BusyBox
+        run: |
+          set -eux
+
+          cp /bin/busybox "$ROOTFS/bin/busybox"
+          chmod 0755 "$ROOTFS/bin/busybox"
+
+          "$ROOTFS/bin/busybox" \
+            --install -s "$ROOTFS/bin"
+
+          ln -sf /bin/busybox "$ROOTFS/bin/sh"
+          ln -sf /bin/busybox "$ROOTFS/bin/ash"
+
+      - name: System configuration
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/etc/hostname" <<'EOF'
+          zenOS
+          EOF
+
+          cat > "$ROOTFS/etc/hosts" <<'EOF'
+          127.0.0.1 localhost
+          127.0.0.1 zenOS
+          ::1 localhost
+          EOF
+
+          cat > "$ROOTFS/etc/passwd" <<'EOF'
+          root:x:0:0:root:/root:/bin/sh
+          EOF
+
+          cat > "$ROOTFS/etc/group" <<'EOF'
+          root:x:0:
+          video:x:44:
+          audio:x:63:
+          input:x:100:
+          render:x:107:
+          EOF
+
+          cat > "$ROOTFS/etc/profile" <<'EOF'
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export USER=root
+          export TERM=linux
+          export PS1='zenos~# '
+          EOF
+
+          chmod 0700 "$ROOTFS/run/user/0"
+          chmod 1777 "$ROOTFS/tmp"
+
+      - name: Weston configuration
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/etc/xdg/weston/weston.ini" <<'EOF'
+          [core]
+          backend=drm-backend.so
+          shell=desktop-shell.so
+          idle-time=0
+
+          [shell]
+          locking=false
+          panel-position=none
+          animation=none
+
+          [keyboard]
+          keymap_layout=us
+
+          [libinput]
+          enable-tap=true
+          EOF
+
+      - name: Network startup
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/usr/bin/zenos-network" <<'EOF'
+          #!/bin/sh
+
+          ip link set lo up 2>/dev/null || true
+
+          if ip link show eth0 >/dev/null 2>&1; then
+              ip link set eth0 up 2>/dev/null || true
+          fi
+
+          exit 0
+          EOF
+
+          chmod 0755 "$ROOTFS/usr/bin/zenos-network"
+
+      - name: Tizen runtime
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/usr/bin/zenos-runtime" <<'EOF'
+          #!/bin/sh
+
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export USER=root
+          export LD_LIBRARY_PATH=/lib:/lib64:/usr/lib:/usr/lib64
+
+          mkdir -p /run/dbus /var/run/dbus /var/log
+
+          if command -v dbus-daemon >/dev/null 2>&1; then
+              dbus-daemon --system --fork \
+                >>/var/log/dbus.log 2>&1 || true
+          fi
+
+          if command -v pkgmgr-server >/dev/null 2>&1; then
+              pkgmgr-server \
+                >>/var/log/pkgmgr-server.log 2>&1 &
+          fi
+
+          if command -v aul-launcher >/dev/null 2>&1; then
+              aul-launcher \
+                >>/var/log/aul-launcher.log 2>&1 &
+          fi
+
+          if command -v launchpad >/dev/null 2>&1; then
+              launchpad \
+                >>/var/log/launchpad.log 2>&1 &
+          fi
+
+          exit 0
+          EOF
+
+          chmod 0755 "$ROOTFS/usr/bin/zenos-runtime"
+
+      - name: GUI launcher
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/usr/bin/zenos-gui" <<'EOF'
+          #!/bin/sh
+
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export USER=root
+          export XDG_RUNTIME_DIR=/run/user/0
+          export XDG_SESSION_TYPE=wayland
+          export WAYLAND_DISPLAY=wayland-0
+
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 0700 "$XDG_RUNTIME_DIR"
+          mkdir -p /var/log
+
+          if [ ! -e /dev/dri/card0 ]; then
+              echo "zenOS: DRM device unavailable" \
+                >>/var/log/zenos-gui.log
+              exit 10
+          fi
+
+          if ! command -v weston >/dev/null 2>&1; then
+              echo "zenOS: Weston unavailable" \
+                >>/var/log/zenos-gui.log
+              exit 11
+          fi
+
+          exec weston \
+            --config=/etc/xdg/weston/weston.ini \
+            --tty=1 \
+            >>/var/log/weston.log 2>&1
+          EOF
+
+          chmod 0755 "$ROOTFS/usr/bin/zenos-gui"
+
+      - name: Emergency shell
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/usr/bin/zenos-shell" <<'EOF'
+          #!/bin/sh
+
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export USER=root
+          export TERM=linux
+          export PS1='zenos~# '
+
+          echo
+          echo "================================"
+          echo "       zenOS Emergency Shell"
+          echo "================================"
+          echo
+          echo "GUI unavailable."
+          echo
+
+          exec /bin/busybox ash
+          EOF
+
+          chmod 0755 "$ROOTFS/usr/bin/zenos-shell"
+
+      - name: Init
+        run: |
+          set -eux
+
+          cat > "$ROOTFS/sbin/zenos-init" <<'EOF'
+          #!/bin/sh
+
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export USER=root
+          export TERM=linux
+
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sysfs /sys 2>/dev/null || true
+          mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+          mount -t tmpfs tmpfs /run 2>/dev/null || true
+
+          mkdir -p /dev/pts /run/user/0 /var/log /tmp
+
+          mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+          chmod 0700 /run/user/0
+          chmod 1777 /tmp
+
+          echo
+          echo "================================"
+          echo "             zenOS"
+          echo "       Tizen ARM64 Minimal"
+          echo "================================"
+          echo
+
+          /usr/bin/zenos-network 2>/dev/null || true
+          /usr/bin/zenos-runtime &
+
+          sleep 2
+
+          if [ ! -x /usr/bin/zenos-gui ]; then
+              exec /usr/bin/zenos-shell
+          fi
+
+          /usr/bin/zenos-gui &
+          GUI_PID=$!
+
+          sleep 6
+
+          if ! kill -0 "$GUI_PID" 2>/dev/null; then
+              echo "zenOS GUI failed."
+              exec /usr/bin/zenos-shell
+          fi
+
+          echo "zenOS GUI started."
+
+          while true; do
+              if ! kill -0 "$GUI_PID" 2>/dev/null; then
+                  echo "zenOS GUI stopped."
+                  exec /usr/bin/zenos-shell
+              fi
+              sleep 3
+          done
+          EOF
+
+          chmod 0755 "$ROOTFS/sbin/zenos-init"
+          ln -sf /sbin/zenos-init "$ROOTFS/init"
+
+      - name: Clean rootfs
+        run: |
+          set -eux
+
+          rm -rf \
+            "$ROOTFS/usr/share/doc" \
+            "$ROOTFS/usr/share/man" \
+            "$ROOTFS/usr/share/info" \
+            "$ROOTFS/usr/share/gtk-doc" \
+            "$ROOTFS/usr/include"
+
+          rm -rf "$ROOTFS/var/cache/"*
+          rm -rf "$ROOTFS/tmp/"*
+
+          mkdir -p "$ROOTFS/tmp"
+          chmod 1777 "$ROOTFS/tmp"
+
+      - name: Create image
+        run: |
+          set -eux
+
+          ROOT_MB=$(du -sm "$ROOTFS" | awk '{print $1}')
+          IMAGE_MB=$((ROOT_MB + 192))
+
+          if [ "$IMAGE_MB" -lt 256 ]; then
+              IMAGE_MB=256
+          fi
+
+          IMAGE="$WORK/zenOS-arm64.img"
+
+          truncate -s "${IMAGE_MB}M" "$IMAGE"
+
+          mkfs.ext4 \
+            -F \
+            -L zenOS \
+            -m 0 \
+            "$IMAGE"
+
+          sudo mount -o loop "$IMAGE" "$WORK/mnt"
+
+          sudo cp -a \
+            "$ROOTFS"/. \
+            "$WORK/mnt"/
+
+          sync
+          sudo umount "$WORK/mnt"
+
+          e2fsck -fy "$IMAGE"
+          resize2fs -M "$IMAGE"
+
+          test -s "$IMAGE"
+          ls -lh "$IMAGE"
+
+      - name: Create QEMU launcher
+        run: |
+          set -eux
+
+          cat > "$WORK/run-zenos.sh" <<'EOF'
+          #!/bin/sh
+
+          set -eu
+
+          BASE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          KERNEL="$BASE/Image"
+          DISK="$BASE/zenOS-arm64.img"
+
+          test -s "$KERNEL"
+          test -s "$DISK"
+
+          echo "Starting zenOS ARM64"
+          echo "VNC: 127.0.0.1:5905"
+
+          exec qemu-system-aarch64 \
+            -machine virt \
+            -cpu cortex-a72 \
+            -m 1024 \
+            -smp 4 \
+            -kernel "$KERNEL" \
+            -append "root=/dev/vda rw rootwait init=/sbin/zenos-init console=ttyAMA0,115200" \
+            -drive "file=$DISK,if=none,format=raw,id=disk" \
+            -device "virtio-blk-pci,drive=disk" \
+            -device "virtio-gpu-pci" \
+            -device "virtio-keyboard-pci" \
+            -device "virtio-mouse-pci" \
+            -device "virtio-rng-pci" \
+            -netdev "user,id=net0" \
+            -device "virtio-net-pci,netdev=net0" \
+            -display "vnc=:5" \
+            -serial "stdio"
+          EOF
+
+          chmod 0755 "$WORK/run-zenos.sh"
+
+      - name: Package
+        run: |
+          set -eux
+
+          PKG="$WORK/zenOS-arm64"
+
+          rm -rf "$PKG"
+          mkdir -p "$PKG"
+
+          cp "$WORK/Image" "$PKG/Image"
+          cp "$WORK/zenOS-arm64.img" "$PKG/zenOS-arm64.img"
+          cp "$WORK/run-zenos.sh" "$PKG/run-zenos.sh"
+
+          cat > "$PKG/README.txt" <<'EOF'
+          zenOS ARM64
+
+          Linux 6.1.80
+          Wayland + Weston
+          VirtIO GPU
+          VirtIO input
+          VirtIO network
+          Tizen userspace
+
+          Start:
+          ./run-zenos.sh
+
+          VNC:
+          127.0.0.1:5905
+
+          Emergency shell:
+          zenos~#
+          EOF
+
+          chmod 0755 "$PKG/run-zenos.sh"
+
+      - name: Create ZIP
+        run: |
+          set -eux
+
+          cd "$WORK"
+
+          rm -f zenOS-arm64.zip
+
+          zip -9 -r \
+            zenOS-arm64.zip \
+            zenOS-arm64
+
+          test -s "$WORK/zenOS-arm64.zip"
+
+      - name: Verify
+        run: |
+          set -eux
+
+          test -s "$WORK/Image"
+          test -s "$WORK/zenOS-arm64.img"
+          test -x "$WORK/run-zenos.sh"
+          test -s "$WORK/zenOS-arm64.zip"
+
+          echo "================================"
+          echo "       zenOS BUILD OK"
+          echo "================================"
+
+          ls -lh \
+            "$WORK/Image" \
+            "$WORK/zenOS-arm64.img" \
+            "$WORK/zenOS-arm64.zip"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-arm64
+          path: |
+            work/zenOS-arm64.zip
+            work/zenOS-arm64.img
+            work/Image
+            work/run-zenos.sh
+          if-no-files-found: error
+          compression-level: 0
