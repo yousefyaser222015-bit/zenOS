@@ -1,0 +1,258 @@
+name: Build zenOS ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget xz-utils cpio \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            qemu-system-arm e2fsprogs rsync
+
+      - name: Download and build Linux
+        run: |
+          set -eux
+          KVER=6.1.80
+          mkdir -p work
+          cd work
+
+          wget -q \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz
+
+          mkdir linux
+          tar -xf linux-${KVER}.tar.xz \
+            --strip-components=1 -C linux
+
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+          scripts/config --enable DEVTMPFS
+          scripts/config --enable DEVTMPFS_MOUNT
+          scripts/config --enable VIRTIO
+          scripts/config --enable VIRTIO_PCI
+          scripts/config --enable VIRTIO_BLK
+          scripts/config --enable VIRTIO_NET
+          scripts/config --enable VIRTIO_CONSOLE
+          scripts/config --enable DRM
+          scripts/config --enable DRM_VIRTIO_GPU
+          scripts/config --enable DRM_FBDEV_EMULATION
+          scripts/config --enable FB
+          scripts/config --enable FB_SIMPLE
+          scripts/config --enable FRAMEBUFFER_CONSOLE
+          scripts/config --enable EXT4_FS
+          scripts/config --enable TMPFS
+          scripts/config --enable PROC_FS
+          scripts/config --enable SYSFS
+          scripts/config --enable UNIX
+          scripts/config --enable INET
+          scripts/config --enable NET
+          scripts/config --enable INPUT
+          scripts/config --enable INPUT_EVDEV
+
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)" Image
+
+      - name: Find valid Tizen snapshot
+        run: |
+          set -eu
+
+          BASE="https://download.tizen.org/snapshots/TIZEN/Tizen/Tizen-Unified"
+
+          curl -fsSL "$BASE/" -o index.html
+
+          grep -oE \
+            'tizen-unified_[0-9]{8}\.[0-9]{6}/' \
+            index.html |
+            sed 's#/$##' |
+            sort -V |
+            tac > snapshots.txt
+
+          test -s snapshots.txt
+
+          SNAPSHOT=""
+          SNAPSHOT_URL=""
+
+          while read -r S; do
+            URL="$BASE/$S/repos/standard/packages/aarch64"
+
+            echo "Testing $S"
+
+            if curl -fsSL \
+              "$URL/repodata/repomd.xml" \
+              -o valid_repomd.xml; then
+
+              echo "VALID: $S"
+
+              SNAPSHOT="$S"
+              SNAPSHOT_URL="$URL"
+              break
+            fi
+          done < snapshots.txt
+
+          test -n "$SNAPSHOT"
+          test -n "$SNAPSHOT_URL"
+
+          echo "SNAPSHOT=$SNAPSHOT" >> "$GITHUB_ENV"
+          echo "SNAPSHOT_URL=$SNAPSHOT_URL" >> "$GITHUB_ENV"
+
+          echo "Selected: $SNAPSHOT"
+
+      - name: Download Tizen packages
+        run: |
+          set -eux
+
+          mkdir -p work/rpms
+          cd work/rpms
+
+          curl -fsSL \
+            "$SNAPSHOT_URL/" \
+            -o packages.html
+
+          grep -oE \
+            'href="[^"]+\.rpm"' \
+            packages.html |
+            cut -d'"' -f2 |
+            sort -u > list.txt
+
+          grep -Ei \
+            'busybox|bash|glibc|wayland|weston|libdrm|pixman|cairo|dbus|systemd|libinput|efl|elementary|enlightenment' \
+            list.txt |
+            grep -vEi \
+              -- '-devel|-debug|-doc|-static|-tests|x11|xorg' |
+            head -80 > selected.txt || true
+
+          while read -r RPM; do
+            test -n "$RPM"
+            curl -fsSL \
+              "$SNAPSHOT_URL/$RPM" \
+              -o "$(basename "$RPM")"
+          done < selected.txt
+
+      - name: Build root filesystem
+        run: |
+          set -eux
+
+          ROOT="$GITHUB_WORKSPACE/work/rootfs"
+          mkdir -p "$ROOT"
+
+          cd work/rpms
+
+          for rpm in *.rpm; do
+            echo "Extracting $rpm"
+            rpm2cpio "$rpm" | cpio -idm --quiet -D "$ROOT"
+          done
+
+          mkdir -p "$ROOT"/{proc,sys,dev,tmp,run,etc}
+          chmod 1777 "$ROOT/tmp"
+
+          cat > "$ROOT/etc/fstab" <<'EOF'
+proc /proc proc defaults 0 0
+sysfs /sys sysfs defaults 0 0
+devtmpfs /dev devtmpfs defaults 0 0
+EOF
+
+      - name: Build zenOS init
+        run: |
+          set -eux
+
+          mkdir -p work/rootfs/sbin
+
+          cat > work/init.c <<'EOF'
+#include <unistd.h>
+#include <sys/mount.h>
+
+int main(void)
+{
+    mount("proc", "/proc", "proc", 0, "");
+    mount("sysfs", "/sys", "sysfs", 0, "");
+    mount("devtmpfs", "/dev", "devtmpfs", 0, "");
+
+    execl("/bin/busybox", "busybox", "sh", "-c",
+          "export PATH=/bin:/sbin:/usr/bin:/usr/sbin; "
+          "echo 'zenOS ARM64'; "
+          "echo 'Wayland / Weston runtime'; "
+          "exec /bin/sh", NULL);
+
+    return 0;
+}
+EOF
+
+          aarch64-linux-gnu-gcc \
+            -static -Os \
+            work/init.c \
+            -o work/rootfs/init
+
+          chmod +x work/rootfs/init
+
+      - name: Create compact image
+        run: |
+          set -eux
+
+          cd work
+
+          SIZE=$(du -sm rootfs | awk '{print $1 + 64}')
+          truncate -s "${SIZE}M" zenOS.ext4
+
+          mkfs.ext4 -F zenOS.ext4
+
+          mkdir mount
+          sudo mount -o loop zenOS.ext4 mount
+
+          sudo cp -a rootfs/. mount/
+
+          sudo umount mount
+
+          cp linux/arch/arm64/boot/Image .
+
+      - name: Create QEMU launcher
+        run: |
+          set -eux
+
+          cat > work/run.sh <<'EOF'
+#!/bin/sh
+exec qemu-system-aarch64 \
+  -M virt \
+  -cpu cortex-a72 \
+  -m 1024 \
+  -smp 2 \
+  -kernel Image \
+  -drive if=none,file=zenOS.ext4,format=raw,id=disk \
+  -device virtio-blk-device,drive=disk \
+  -netdev user,id=n0 \
+  -device virtio-net-device,netdev=n0 \
+  -display none \
+  -vnc :5 \
+  -serial stdio \
+  -append "root=/dev/vda rw rootwait console=ttyAMA0"
+EOF
+
+          chmod +x work/run.sh
+
+      - name: Package zenOS
+        run: |
+          set -eux
+
+          cd work
+
+          zip -r ../zenOS-arm64.zip \
+            zenOS.ext4 \
+            Image \
+            run.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-arm64
+          path: zenOS-arm64.zip
