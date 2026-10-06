@@ -1,0 +1,332 @@
+name: Build zenOS ARM64
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu bc bison flex libssl-dev \
+            libncurses-dev wget cpio qemu-system-arm qemu-utils zip unzip
+
+      - name: Download BusyBox
+        run: |
+          mkdir -p zenos-rootfs/bin
+          wget -O zenos-rootfs/bin/busybox \
+            https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu
+          chmod +x zenos-rootfs/bin/busybox
+
+      - name: Build Linux Kernel
+        run: |
+          git clone --depth=1 https://github.com/torvalds/linux.git
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          # Enable framebuffer and minimal drivers
+          ./scripts/config -e CONFIG_FRAMEBUFFER_CONSOLE -e CONFIG_FB -e CONFIG_VT -e CONFIG_INPUT_EVDEV
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules
+          cp arch/arm64/boot/Image ../kernel.img
+
+      - name: Create init (zenos init + TPK loader)
+        run: |
+          cat > init.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <string.h>
+          #include <dirent.h>
+          #include <linux/fb.h>
+          #include <fcntl.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          
+          #define FB_PATH "/dev/fb0"
+          #define TPK_DIR "/tpk"
+          
+          struct tpk_app {
+              char name[256];
+              char exec_path[512];
+          };
+          struct tpk_app apps[32];
+          int app_count = 0;
+          
+          static void fb_clear(void *fbp, int w, int h, int bpp) {
+              memset(fbp, 0, w * h * bpp / 8);
+          }
+          
+          static void fb_draw_rect(void *fbp, int w, int h, int bpp, int x, int y, int rw, int rh, uint32_t color) {
+              int px = bpp / 8;
+              for (int j = y; j < y + rh && j < h; j++)
+                  for (int i = x; i < x + rw && i < w; i++)
+                      *(uint32_t*)(fbp + (j*w + i)*px) = color;
+          }
+          
+          static void fb_draw_text(void *fbp, int w, int h, int bpp, int x, int y, const char *text, uint32_t color) {
+              // Simple 8x8 bitmap font for ASCII 32-126 (minimal)
+              // Each char is 8 bytes (8x8, 1 bit/pixel, padded)
+              static const unsigned char font[95][8] = {
+                  {0,0,0,0,0,0,0,0}, {0x18,0x18,0x18,0x18,0,0,0x18,0}, // space, !
+                  {0x36,0x36,0,0,0,0,0,0}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0}, // ", #
+                  {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0}, {0,0x63,0x33,0x18,0x0C,0x66,0x63,0}, // $, %
+                  {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0}, {0x06,0x06,0x03,0,0,0,0,0}, // &, '
+                  {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0}, // (, )
+                  {0,0x66,0x3C,0xFF,0x3C,0x66,0,0}, {0,0x0C,0x0C,0x3F,0x0C,0x0C,0,0}, // *, +
+                  {0,0,0,0,0,0x0C,0x0C,0x06}, {0,0,0,0x3F,0,0,0,0}, // ,, -
+                  {0,0,0,0,0,0x0C,0x0C,0}, {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0}, // ., /
+                  {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0}, // 0, 1
+                  {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0}, // 2, 3
+                  {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0}, // 4, 5
+                  {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0}, {0x3F,0x30,0x18,0x0C,0x06,0x06,0x06,0}, // 6, 7
+                  {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0}, // 8, 9
+                  {0,0x0C,0x0C,0,0,0x0C,0x0C,0}, {0,0x0C,0x0C,0,0,0x0C,0x0C,0x06}, // :, ;
+                  {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0}, {0,0,0x3F,0,0,0x3F,0,0}, // <, =
+                  {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0}, {0x1E,0x33,0x30,0x18,0x0C,0,0x0C,0}, // >, ?
+                  {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0}, {0x0F,0x18,0x30,0x3E,0x33,0x33,0x33,0}, // @, A
+                  {0x1F,0x33,0x33,0x1F,0x33,0x33,0x1F,0}, {0x1E,0x33,0x03,0x03,0x03,0x33,0x1E,0}, // B, C
+                  {0x0F,0x1B,0x33,0x33,0x33,0x1B,0x0F,0}, {0x3F,0x03,0x03,0x1F,0x03,0x03,0x3F,0}, // D, E
+                  {0x3F,0x03,0x03,0x1F,0x03,0x03,0x03,0}, {0x1E,0x33,0x03,0x3F,0x33,0x33,0x3E,0}, // F, G
+                  {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0}, // H, I
+                  {0x3C,0x18,0x18,0x18,0x18,0x1B,0x0E,0}, {0x33,0x1B,0x0F,0x07,0x0F,0x1B,0x33,0}, // J, K
+                  {0x03,0x03,0x03,0x03,0x03,0x03,0x3F,0}, {0x33,0x77,0x55,0x55,0x41,0x41,0x41,0}, // L, M
+                  {0x33,0x3B,0x3F,0x37,0x33,0x33,0x33,0}, {0x1E,0x33,0x33,0x33,0x33,0x33,0x1E,0}, // N, O
+                  {0x1F,0x33,0x33,0x1F,0x03,0x03,0x03,0}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0}, // P, Q
+                  {0x1F,0x33,0x33,0x1F,0x0F,0x1B,0x33,0}, {0x1E,0x33,0x03,0x1E,0x30,0x33,0x1E,0}, // R, S
+                  {0x3F,0x2C,0x0C,0x0C,0x0C,0x0C,0x1E,0}, {0x33,0x33,0x33,0x33,0x33,0x33,0x1E,0}, // T, U
+                  {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0}, {0x41,0x41,0x41,0x49,0x49,0x49,0x36,0}, // V, W
+                  {0x33,0x33,0x1E,0x0C,0x1E,0x33,0x33,0}, {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x0C,0}, // X, Y
+                  {0x7F,0x63,0x31,0x18,0x0C,0x67,0x7F,0}, {0x3F,0x30,0x30,0x1E,0x03,0x03,0x3F,0}, // Z, [
+                  {0x01,0x03,0x06,0x0C,0x18,0x30,0x20,0}, {0x3F,0x03,0x03,0x0E,0x18,0x18,0x0F,0}, // \, ]
+                  {0x08,0x1C,0x36,0x63,0,0,0,0}, {0,0,0,0,0,0,0,0xFF}, // ^, _
+                  {0x0C,0x0C,0x06,0,0,0,0,0}, {0,0,0x1E,0x30,0x3E,0x33,0x6E,0}, // `, a
+                  {0x03,0x03,0x1F,0x33,0x33,0x33,0x1F,0}, {0,0,0x1E,0x33,0x03,0x33,0x1E,0}, // b, c
+                  {0x30,0x30,0x3E,0x33,0x33,0x33,0x3E,0}, {0,0,0x1E,0x33,0x3F,0x03,0x1E,0}, // d, e
+                  {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0}, {0,0,0x1E,0x33,0x33,0x3E,0x30,0x1F}, // f, g
+                  {0x03,0x03,0x1F,0x33,0x33,0x33,0x33,0}, {0x0C,0,0x0E,0x0C,0x0C,0x0C,0x1E,0}, // h, i
+                  {0x30,0,0x30,0x30,0x30,0x33,0x1E,0}, {0x03,0x03,0x33,0x1B,0x0F,0x1B,0x33,0}, // j, k
+                  {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0}, {0,0,0x33,0x77,0x55,0x41,0x41,0}, // l, m
+                  {0,0,0x1F,0x33,0x33,0x33,0x33,0}, {0,0,0x1E,0x33,0x33,0x33,0x1E,0}, // n, o
+                  {0,0,0x1F,0x33,0x33,0x1F,0x03,0x03}, {0,0,0x3E,0x33,0x33,0x3E,0x30,0x30}, // p, q
+                  {0,0,0x1B,0x37,0x07,0x03,0x03,0}, {0,0,0x3E,0x33,0x07,0x1E,0x38,0x1E}, // r, s
+                  {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0}, {0,0,0x33,0x33,0x33,0x33,0x6E,0}, // t, u
+                  {0,0,0x33,0x33,0x33,0x1E,0x0C,0}, {0,0,0x41,0x41,0x49,0x55,0x36,0}, // v, w
+                  {0,0,0x33,0x1E,0x0C,0x1E,0x33,0}, {0,0,0x33,0x33,0x33,0x3E,0x30,0x1F}, // x, y
+                  {0,0,0x3F,0x1C,0x0C,0x0C,0x3F,0}, {0x1C,0x18,0x18,0x0E,0x18,0x18,0x1C,0}, // z, {
+                  {0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0}, {0x0E,0x18,0x18,0x38,0x18,0x18,0x0E,0}, // |, }
+                  {0x6E,0x3B,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0} // ~, DEL
+              };
+              int len = strlen(text);
+              int px = bpp / 8;
+              for (int c = 0; c < len; c++) {
+                  unsigned char ch = text[c];
+                  if (ch < 32 || ch > 126) ch = '?';
+                  for (int row = 0; row < 8; row++) {
+                      unsigned char bits = font[ch - 32][row];
+                      for (int col = 0; col < 8; col++) {
+                          if (bits & (0x80 >> col)) {
+                              int xx = x + c * 8 + col;
+                              int yy = y + row;
+                              if (xx < w && yy < h)
+                                  *(uint32_t*)(fbp + (yy*w + xx)*px) = color;
+                          }
+                      }
+                  }
+              }
+          }
+          
+          static void scan_tpks(void) {
+              DIR *d = opendir(TPK_DIR);
+              if (!d) return;
+              struct dirent *e;
+              app_count = 0;
+              while ((e = readdir(d)) != NULL && app_count < 32) {
+                  if (strstr(e->d_name, ".tpk")) {
+                      snprintf(apps[app_count].name, sizeof(apps[0].name), "%s", e->d_name);
+                      snprintf(apps[app_count].exec_path, sizeof(apps[0].exec_path), TPK_DIR "/%s/main.sh", e->d_name);
+                      app_count++;
+                  }
+              }
+              closedir(d);
+          }
+          
+          static void launch_tpk(const char *tpk_name) {
+              char unpack_dir[512];
+              snprintf(unpack_dir, sizeof(unpack_dir), "/tmp/%s", tpk_name);
+              mkdir(unpack_dir, 0755);
+              char cmd[1024];
+              snprintf(cmd, sizeof(cmd), "/bin/busybox unzip -o -d %s %s/%s", unpack_dir, TPK_DIR, tpk_name);
+              system(cmd);
+              
+              // TPK structure: shared/res/, author-signature.xml, tizen-manifest.xml
+              // Look for executable in shared/res or a bin/ folder
+              char exe_path[1024];
+              snprintf(exe_path, sizeof(exe_path), "%s/shared/res/entry.sh", unpack_dir);
+              struct stat st;
+              if (stat(exe_path, &st) != 0) {
+                  snprintf(exe_path, sizeof(exe_path), "%s/entry.sh", unpack_dir);
+                  if (stat(exe_path, &st) != 0)
+                      snprintf(exe_path, sizeof(exe_path), "%s/bin/main", unpack_dir);
+              }
+              
+              pid_t pid = fork();
+              if (pid == 0) {
+                  chdir(unpack_dir);
+                  chmod(exe_path, 0755);
+                  execl(exe_path, exe_path, NULL);
+                  exit(1);
+              } else if (pid > 0) {
+                  int status;
+                  waitpid(pid, &status, 0);
+              }
+          }
+          
+          int main(int argc, char **argv) {
+              mount("proc", "/proc", "proc", 0, NULL);
+              mount("sysfs", "/sys", "sysfs", 0, NULL);
+              mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+              mkdir("/dev/pts", 0755);
+              mount("devpts", "/dev/pts", "devpts", 0, NULL);
+              mkdir("/tmp", 01777);
+              mkdir(TPK_DIR, 0755);
+              
+              // Spawn busybox init/shell on tty2
+              if (fork() == 0) {
+                  setsid();
+                  int fd = open("/dev/tty2", O_RDWR);
+                  if (fd >= 0) {
+                      dup2(fd, 0); dup2(fd, 1); dup2(fd, 2);
+                      if (fd > 2) close(fd);
+                  }
+                  setenv("PS1", "zenos~# ", 1);
+                  execl("/bin/busybox", "sh", NULL);
+                  exit(1);
+              }
+              
+              // GUI on framebuffer - Tizen-like launcher
+              int fd = open(FB_PATH, O_RDWR);
+              if (fd < 0) fd = open("/dev/tty1", O_RDWR);
+              void *fbp = NULL;
+              int fb_w = 0, fb_h = 0, fb_bpp = 0;
+              struct fb_var_screeninfo vinfo;
+              if (fd >= 0 && ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+                  fb_w = vinfo.xres; fb_h = vinfo.yres; fb_bpp = vinfo.bits_per_pixel;
+                  long screensize = vinfo.xres * vinfo.yres * vinfo.bits_per_pixel / 8;
+                  fbp = mmap(0, screensize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+              }
+              
+              if (fbp && fb_w > 0) {
+                  fb_clear(fbp, fb_w, fb_h, fb_bpp);
+                  // Tizen-like top bar
+                  fb_draw_rect(fbp, fb_w, fb_h, fb_bpp, 0, 0, fb_w, 40, 0xFF1A1A2E);
+                  fb_draw_text(fbp, fb_w, fb_h, fb_bpp, 10, 16, "zenOS", 0xFFFFFFFF);
+                  // App grid (2 columns)
+                  scan_tpks();
+                  for (int i = 0; i < app_count; i++) {
+                      int col = i % 2, row = i / 2;
+                      int x = 20 + col * (fb_w/2 - 20);
+                      int y = 80 + row * 100;
+                      fb_draw_rect(fbp, fb_w, fb_h, fb_bpp, x, y, fb_w/2 - 40, 80, 0xFF0F4C75);
+                      fb_draw_text(fbp, fb_w, fb_h, fb_bpp, x + 8, y + 36, apps[i].name, 0xFFFFFFFF);
+                  }
+                  if (app_count == 0) {
+                      fb_draw_text(fbp, fb_w, fb_h, fb_bpp, 20, fb_h/2, "No TPK apps found. Drop .tpk in /tpk", 0xFFFFFFAA);
+                  }
+                  // Bottom bar
+                  fb_draw_rect(fbp, fb_w, fb_h, fb_bpp, 0, fb_h - 40, fb_w, 40, 0xFF1A1A2E);
+                  fb_draw_text(fbp, fb_w, fb_h, fb_bpp, 10, fb_h - 28, "zenos~# ready | TPK Loader v1", 0xFFFFFFFF);
+                  munmap(fbp, fb_w * fb_h * fb_bpp / 8);
+              }
+              if (fd >= 0) close(fd);
+              
+              // Reap shell zombies periodically
+              while (1) {
+                  int status;
+                  while (waitpid(-1, &status, WNOHANG) > 0);
+                  sleep(2);
+                  if (fbp) { // refresh TPK list if new apps dropped
+                      int old = app_count;
+                      scan_tpks();
+                      if (old != app_count) break; // simple refresh trigger
+                  }
+              }
+              return 0;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -O2 -static -o zenos-rootfs/init init.c
+          chmod +x zenos-rootfs/init
+
+      - name: Build initramfs
+        run: |
+          # Create basic rootfs structure
+          cd zenos-rootfs
+          mkdir -p dev proc sys tmp tpk
+          ln -sf bin/busybox bin/sh
+          ln -sf bin/busybox bin/ls
+          ln -sf bin/busybox bin/cat
+          ln -sf bin/busybox bin/mkdir
+          ln -sf bin/busybox bin/unzip
+          ln -sf bin/busybox bin/mount
+          
+          # Sample TPK app (fake)
+          mkdir -p tpk/demo.tpk/shared/res
+          cat > tpk/demo.tpk/shared/res/entry.sh << 'TPK'
+          #!/bin/sh
+          echo "Hello from zenOS TPK app!"
+          sleep 3
+          TPK
+          chmod +x tpk/demo.tpk/shared/res/entry.sh
+          
+          # Create cpio initramfs
+          find . | cpio -H newc -o | gzip > ../initramfs.img
+
+      - name: Build U-Boot (minimal)
+        run: |
+          git clone --depth=1 https://github.com/u-boot/u-boot.git
+          cd u-boot
+          make CROSS_COMPILE=aarch64-linux-gnu- qemu_arm64_defconfig
+          make CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) u-boot.bin
+          cp u-boot.bin ../u-boot.bin
+
+      - name: Create disk image
+        run: |
+          # Create a small ext4 image that QEMU can boot
+          dd if=/dev/zero of=zenos.img bs=1M count=64
+          mkfs.ext4 -F zenos.img
+          mkdir -p mnt
+          sudo mount -o loop zenos.img mnt
+          sudo cp kernel.img mnt/
+          sudo cp initramfs.img mnt/
+          sudo cp u-boot.bin mnt/
+          sudo sync
+          sudo umount mnt
+          gzip -k zenos.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenos-arm64
+          path: |
+            zenos.img.gz
+            kernel.img
+            initramfs.img
+            u-boot.bin
+
+      - name: Test in QEMU
+        run: |
+          timeout 30 qemu-system-aarch64 \
+            -M virt -cpu cortex-a57 -m 512 -nographic \
+            -kernel kernel.img \
+            -initrd initramfs.img \
+            -append "console=ttyAMA0 rdinit=/init" \
+            || true
