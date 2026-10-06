@@ -1,0 +1,95 @@
+name: Build zenOS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu build-essential bc bison flex libssl-dev libelf-dev e2fsprogs cpio unzip git wget python3 swig device-tree-compiler
+
+      - name: Build zenOS
+        run: |
+          set -ex
+          mkdir -p src rootfs/bin rootfs/etc rootfs/proc rootfs/sys rootfs/dev rootfs/tmp rootfs/apps out
+          echo "=== busybox latest from GitHub with fix ==="
+          git clone --depth=1 https://github.com/mirror/busybox.git
+          cd busybox
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          sed -i 's/CONFIG_WERROR=y/# CONFIG_WERROR is not set/'.config || true
+          echo "# CONFIG_WERROR is not set" >>.config
+          echo "CONFIG_STATIC=y" >>.config
+          # fix ftruncate warn_unused_result bug in master
+          sed -i 's/ftruncate(G.output_fd, pos);/(void)ftruncate(G.output_fd, pos);/g' archival/libarchive/data_extract_all.c 2>/dev/null || true
+          grep -R "ftruncate(G.output_fd" --include="*.c" -l | xargs -r sed -i 's/ftruncate(G.output_fd, pos);/(void)ftruncate(G.output_fd, pos);/g' || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- EXTRA_CFLAGS="-Wno-error=unused-result -Wno-error" -j$(nproc) busybox
+          cd..
+          cp busybox/busybox rootfs/bin/busybox
+          rootfs/bin/busybox --install -s rootfs/bin || true
+          ln -sf busybox rootfs/bin/sh
+
+          cat > src/init.c <<CEND
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/mount.h>
+          #include <sys/wait.h>
+          #include <sys/reboot.h>
+          #include <linux/reboot.h>
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <linux/fb.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          static int fb_fd=-1; static char *fbp=NULL; static struct fb_var_screeninfo vinfo; static struct fb_fix_screeninfo finfo;
+          void fb_init(){fb_fd=open("/dev/fb0",O_RDWR); if(fb_fd<0) return; ioctl(fb_fd,FBIOGET_FSCREENINFO,&finfo); ioctl(fb_fd,FBIOGET_VSCREENINFO,&vinfo); long sz=vinfo.xres*vinfo.yres*vinfo.bits_per_pixel/8; fbp=mmap(0,sz,PROT_READ|PROT_WRITE,MAP_SHARED,fb_fd,0); if(fbp==MAP_FAILED) fbp=NULL;}
+          void fb_pix(int x,int y,int c){if(!fbp) return; if(x<0||y<0||x>=(int)vinfo.xres||y>=(int)vinfo.yres) return; long off=(x+vinfo.xoffset)*(vinfo.bits_per_pixel/8)+(y+vinfo.yoffset)*finfo.line_length; if(vinfo.bits_per_pixel==32) *(unsigned int*)(fbp+off)=c;}
+          void fb_rect(int x,int y,int w,int h,int c){for(int j=y;j<y+h;j++) for(int i=x;i<x+w;i++) fb_pix(i,j,c);}
+          void fb_clear(int c){if(!fbp) return; fb_rect(0,0,vinfo.xres,vinfo.yres,c);}
+          void fb_circle(int cx,int cy,int r,int c){for(int y=-r;y<=r;y++) for(int x=-r;x<=r;x++) if(x*x+y*y<=r*r) fb_pix(cx+x,cy+y,c);}
+          void draw_home(){if(!fbp) return; fb_clear(0x101020); fb_rect(0,0,vinfo.xres,38,0x1E1E2F); DIR *d=opendir("/apps"); if(!d) return; struct dirent *e; int i=0; while((e=readdir(d))){if(e->d_name[0]==46) continue; int cx=70+(i%4)*110, cy=90+(i/4)*110; fb_circle(cx,cy,32,(50+(i*37)%180<<16)|(80+(i*61)%150<<8)|200); i++; if(i>11) break;} closedir(d);}
+          int install_tpk(const char *p){char b[128]; const char *s=strrchr(p,47); s=s?s+1:p; strncpy(b,s,sizeof(b)); char *d=strrchr(b,46); if(d) *d=0; if(!b[0]) strcpy(b,"app"); char dest[256]; snprintf(dest,sizeof(dest),"/apps/%s",b); mkdir("/apps",0755); mkdir(dest,0755); char cmd[512]; snprintf(cmd,sizeof(cmd),"unzip -o %s -d %s >/dev/null 2>&1",p,dest); return system(cmd);}
+          void shell_loop(){char l[512]; while(1){printf("zenos~# "); fflush(stdout); if(!fgets(l,sizeof(l),stdin)){sleep(1);continue;} l[strcspn(l,"\n")]='\0'; if(!*l) continue; if(!strcmp(l,"help")) printf("help ls gui list install <tpk> run <app>\n"); else if(!strcmp(l,"gui")){fb_init(); draw_home();} else if(!strncmp(l,"install ",8)) install_tpk(l+8); else system(l);}}
+          int main(){mount("devtmpfs","/dev","devtmpfs",0,0); mount("proc","/proc","proc",0,0); mount("sysfs","/sys","sysfs",0,0); mkdir("/tmp",0777); mount("tmpfs","/tmp","tmpfs",0,0); printf("=== zenOS 1.0 ===\n"); fb_init(); if(fbp) draw_home(); shell_loop(); return 0;}
+          CEND
+          aarch64-linux-gnu-gcc -static -O2 src/init.c -o rootfs/init
+          chmod +x rootfs/init
+          echo "root:x:0:0:root:/root:/bin/sh" > rootfs/etc/passwd
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.32.tar.xz
+          tar xf linux-6.6.32.tar.xz
+          cd linux-6.6.32
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+          cp arch/arm64/boot/Image../out/Image
+          cd..
+          git clone --depth=1 https://github.com/u-boot/u-boot.git
+          cd u-boot
+          make qemu_arm64_defconfig
+          make CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) || true
+          cp u-boot.bin../out/u-boot.bin || true
+          cd..
+          cp out/Image./Image
+          cp out/u-boot.bin./u-boot.bin || touch u-boot.bin
+          (cd rootfs && find. | cpio -o -H newc | gzip >../out/initramfs.cpio.gz)
+          cp out/initramfs.cpio.gz./initramfs.cpio.gz
+          dd if=/dev/zero of=zenos.img bs=1M count=256
+          mkfs.ext4 -F -L zenos -d rootfs zenos.img
+          ls -lh zenos.img Image
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenos-arm64
+          path: |
+            zenos.img
+            Image
+            u-boot.bin
+            initramfs.cpio.gz
