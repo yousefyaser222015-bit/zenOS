@@ -1,0 +1,609 @@
+name: Build zenOS ARM64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            cpio gzip \
+            qemu-system-arm \
+            unzip
+
+      - name: Download Linux
+        run: |
+          git clone --depth=1 \
+            https://github.com/torvalds/linux.git linux
+
+      - name: Get latest BusyBox source
+        run: |
+          git clone --depth=1 \
+            https://github.com/mirror/busybox.git busybox
+
+          cd busybox
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            defconfig
+
+          sed -i \
+            's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+            .config
+
+          sed -i \
+            's/^# CONFIG_UNZIP is not set/CONFIG_UNZIP=y/' \
+            .config || true
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j$(nproc) busybox
+
+          mkdir -p "$GITHUB_WORKSPACE/root/bin"
+
+          cp busybox \
+            "$GITHUB_WORKSPACE/root/bin/busybox"
+
+          chmod 755 \
+            "$GITHUB_WORKSPACE/root/bin/busybox"
+
+      - name: Prepare root filesystem
+        run: |
+          mkdir -p root/{dev,proc,sys,run,tmp,etc,root,apps}
+          mkdir -p root/{sbin,usr/bin,usr/sbin}
+
+          cd root/bin
+
+          ./busybox --install -s .
+
+          cd ../..
+
+          cat > root/etc/profile <<'EOF'
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export TERM=linux
+          export PS1='zenos~# '
+          EOF
+
+      - name: Build zenOS init
+        run: |
+          cat > root/init.c <<'EOF'
+          #include <unistd.h>
+          #include <sys/mount.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <stdlib.h>
+
+          static void mount_fs(
+              const char *src,
+              const char *dst,
+              const char *type)
+          {
+              mkdir(dst, 0755);
+              mount(src, dst, type, 0, 0);
+          }
+
+          int main(void)
+          {
+              if (getpid() != 1)
+                  return 1;
+
+              mount_fs("proc", "proc", "proc");
+              mount_fs("sysfs", "sys", "sysfs");
+              mount_fs("devtmpfs", "dev", "devtmpfs");
+              mount_fs("tmpfs", "run", "tmpfs");
+              mount_fs("tmpfs", "tmp", "tmpfs");
+
+              setenv(
+                  "PATH",
+                  "/bin:/sbin:/usr/bin:/usr/sbin",
+                  1
+              );
+
+              setenv("HOME", "/root", 1);
+              setenv("TERM", "linux", 1);
+              setenv("PS1", "zenos~# ", 1);
+
+              for (;;)
+              {
+                  pid_t p = fork();
+
+                  if (p == 0)
+                  {
+                      char *argv[] = {
+                          "/bin/sh",
+                          "-l",
+                          NULL
+                      };
+
+                      execv(argv[0], argv);
+                      _exit(127);
+                  }
+
+                  if (p > 0)
+                      waitpid(p, NULL, 0);
+              }
+
+              return 0;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc \
+            -static \
+            -O2 \
+            root/init.c \
+            -o root/init
+
+          chmod 755 root/init
+
+      - name: Build TPK runtime
+        run: |
+          cat > root/usr/bin/zenos-tpk.c <<'EOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <dirent.h>
+          #include <string.h>
+          #include <limits.h>
+          #include <elf.h>
+
+          static int find_elf(
+              const char *dir,
+              char *out)
+          {
+              DIR *d = opendir(dir);
+
+              if (!d)
+                  return -1;
+
+              struct dirent *e;
+
+              while ((e = readdir(d)))
+              {
+                  if (e->d_name[0] == '.')
+                      continue;
+
+                  char p[PATH_MAX];
+
+                  snprintf(
+                      p,
+                      sizeof(p),
+                      "%s/%s",
+                      dir,
+                      e->d_name
+                  );
+
+                  struct stat st;
+
+                  if (stat(p, &st))
+                      continue;
+
+                  if (S_ISDIR(st.st_mode))
+                  {
+                      if (!find_elf(p, out))
+                      {
+                          closedir(d);
+                          return 0;
+                      }
+
+                      continue;
+                  }
+
+                  if (!S_ISREG(st.st_mode))
+                      continue;
+
+                  if (!(st.st_mode & 0111))
+                      continue;
+
+                  FILE *f = fopen(p, "rb");
+
+                  if (!f)
+                      continue;
+
+                  unsigned char h[20];
+
+                  if (fread(h, 1, sizeof(h), f)
+                      != sizeof(h))
+                  {
+                      fclose(f);
+                      continue;
+                  }
+
+                  fclose(f);
+
+                  if (h[0] != 0x7f ||
+                      h[1] != 'E' ||
+                      h[2] != 'L' ||
+                      h[3] != 'F')
+                      continue;
+
+                  if (h[4] != ELFCLASS64)
+                      continue;
+
+                  if (h[5] != ELFDATA2LSB)
+                      continue;
+
+                  unsigned short machine =
+                      h[18] |
+                      ((unsigned short)h[19] << 8);
+
+                  if (machine != EM_AARCH64)
+                      continue;
+
+                  strncpy(
+                      out,
+                      p,
+                      PATH_MAX - 1
+                  );
+
+                  out[PATH_MAX - 1] = 0;
+
+                  closedir(d);
+                  return 0;
+              }
+
+              closedir(d);
+              return -1;
+          }
+
+          int main(int argc, char **argv)
+          {
+              if (argc != 2)
+              {
+                  fprintf(
+                      stderr,
+                      "usage: tpk package.tpk\n"
+                  );
+
+                  return 2;
+              }
+
+              char dir[PATH_MAX];
+
+              snprintf(
+                  dir,
+                  sizeof(dir),
+                  "/tmp/tpk-%d",
+                  getpid()
+              );
+
+              mkdir(dir, 0700);
+
+              pid_t p = fork();
+
+              if (p == 0)
+              {
+                  execl(
+                      "/bin/busybox",
+                      "busybox",
+                      "unzip",
+                      "-o",
+                      argv[1],
+                      "-d",
+                      dir,
+                      NULL
+                  );
+
+                  _exit(127);
+              }
+
+              int status;
+
+              waitpid(p, &status, 0);
+
+              if (!WIFEXITED(status) ||
+                  WEXITSTATUS(status))
+              {
+                  fprintf(
+                      stderr,
+                      "TPK: invalid ZIP package\n"
+                  );
+
+                  return 3;
+              }
+
+              char executable[PATH_MAX];
+
+              if (find_elf(dir, executable))
+              {
+                  fprintf(
+                      stderr,
+                      "TPK: no ARM64 ELF found\n"
+                  );
+
+                  return 4;
+              }
+
+              printf(
+                  "TPK: launching %s\n",
+                  executable
+              );
+
+              execl(
+                  executable,
+                  executable,
+                  NULL
+              );
+
+              return 5;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc \
+            -static \
+            -O2 \
+            root/usr/bin/zenos-tpk.c \
+            -o root/usr/bin/zenos-tpk
+
+          rm root/usr/bin/zenos-tpk.c
+
+          chmod 755 root/usr/bin/zenos-tpk
+
+          cat > root/usr/bin/tpk <<'EOF'
+          #!/bin/sh
+          exec /usr/bin/zenos-tpk "$1"
+          EOF
+
+          chmod 755 root/usr/bin/tpk
+
+      - name: Build zenOS framebuffer GUI
+        run: |
+          cat > root/usr/bin/zenos-gui.c <<'EOF'
+          #include <fcntl.h>
+          #include <stdint.h>
+          #include <unistd.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          #include <linux/fb.h>
+
+          static uint32_t rgb(
+              int r,
+              int g,
+              int b)
+          {
+              return
+                  ((r & 255) << 16) |
+                  ((g & 255) << 8) |
+                  (b & 255);
+          }
+
+          static void fill(
+              uint32_t *fb,
+              int w,
+              int h,
+              int x,
+              int y,
+              int rw,
+              int rh,
+              uint32_t c)
+          {
+              for (int yy = y; yy < y + rh; yy++)
+              {
+                  for (int xx = x; xx < x + rw; xx++)
+                  {
+                      if (xx >= 0 &&
+                          yy >= 0 &&
+                          xx < w &&
+                          yy < h)
+                      {
+                          fb[yy * w + xx] = c;
+                      }
+                  }
+              }
+          }
+
+          int main(void)
+          {
+              int fd = open(
+                  "/dev/fb0",
+                  O_RDWR
+              );
+
+              if (fd < 0)
+                  return 1;
+
+              struct fb_var_screeninfo v;
+
+              if (ioctl(
+                      fd,
+                      FBIOGET_VSCREENINFO,
+                      &v))
+                  return 1;
+
+              int w = v.xres;
+              int h = v.yres;
+
+              size_t bytes =
+                  (size_t)w * h * 4;
+
+              uint32_t *fb = mmap(
+                  NULL,
+                  bytes,
+                  PROT_READ | PROT_WRITE,
+                  MAP_SHARED,
+                  fd,
+                  0
+              );
+
+              if (fb == MAP_FAILED)
+                  return 1;
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  0,
+                  0,
+                  w,
+                  h,
+                  rgb(7, 11, 20)
+              );
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  0,
+                  0,
+                  w,
+                  h / 8,
+                  rgb(20, 28, 46)
+              );
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  w / 8,
+                  h / 5,
+                  w * 3 / 4,
+                  h / 3,
+                  rgb(27, 39, 65)
+              );
+
+              int s = w / 7;
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  w / 8,
+                  h * 3 / 5,
+                  s,
+                  s,
+                  rgb(30, 120, 220)
+              );
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  w / 2 - s / 2,
+                  h * 3 / 5,
+                  s,
+                  s,
+                  rgb(40, 165, 100)
+              );
+
+              fill(
+                  fb,
+                  w,
+                  h,
+                  w * 7 / 10,
+                  h * 3 / 5,
+                  s,
+                  s,
+                  rgb(180, 75, 120)
+              );
+
+              munmap(fb, bytes);
+              close(fd);
+
+              return 0;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc \
+            -static \
+            -O2 \
+            root/usr/bin/zenos-gui.c \
+            -o root/usr/bin/zenos-gui
+
+          rm root/usr/bin/zenos-gui.c
+
+          chmod 755 root/usr/bin/zenos-gui
+
+      - name: Linux ARM64 kernel
+        run: |
+          cd linux
+
+          make ARCH=arm64 defconfig
+
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          ./scripts/config --enable CONFIG_BLK_DEV_INITRD
+          ./scripts/config --enable CONFIG_TMPFS
+
+          ./scripts/config --enable CONFIG_VIRTIO
+          ./scripts/config --enable CONFIG_VIRTIO_PCI
+          ./scripts/config --enable CONFIG_VIRTIO_NET
+
+          ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011
+          ./scripts/config --enable CONFIG_SERIAL_AMBA_PL011_CONSOLE
+
+          ./scripts/config --enable CONFIG_FB
+          ./scripts/config --enable CONFIG_FB_SIMPLE
+
+          make ARCH=arm64 olddefconfig
+
+          make \
+            -j$(nproc) \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+      - name: Create zenOS IMG
+        run: |
+          cd root
+
+          find . -print0 |
+            cpio \
+              --null \
+              -o \
+              -H newc |
+            gzip -9 \
+            > ../zenos.img
+
+      - name: Release
+        run: |
+          mkdir -p release
+
+          cp \
+            linux/arch/arm64/boot/Image \
+            release/Image
+
+          cp \
+            zenos.img \
+            release/zenos.img
+
+          sha256sum \
+            release/Image \
+            release/zenos.img \
+            > release/SHA256SUMS
+
+          ls -lh release/
+
+      - name: QEMU ARM64 test
+        timeout-minutes: 2
+        run: |
+          timeout 30 \
+          qemu-system-aarch64 \
+            -M virt \
+            -cpu cortex-a57 \
+            -m 512 \
+            -kernel linux/arch/arm64/boot/Image \
+            -initrd zenos.img \
+            -append "console=ttyAMA0 rdinit=/init" \
+            -nographic \
+            || test $? -eq 124
+
+      - name: Upload zenOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenOS-ARM64
+          path: release/
