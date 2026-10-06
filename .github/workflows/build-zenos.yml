@@ -1,0 +1,268 @@
+name: ZenOS ARM64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential gcc-aarch64-linux-gnu \
+            bc bison flex libssl-dev libelf-dev cpio gzip \
+            qemu-system-arm
+
+      - name: Sources
+        run: |
+          git clone --depth=1 https://github.com/torvalds/linux.git linux
+          git clone --depth=1 https://github.com/mirror/busybox.git busybox
+
+      - name: BusyBox
+        run: |
+          cd busybox
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make CONFIG_PREFIX=$GITHUB_WORKSPACE/root install
+
+      - name: ZenOS userspace
+        run: |
+          mkdir -p root/{dev,proc,sys,tmp,run,etc,root,apps,usr/bin}
+
+          cat > root/etc/profile <<'EOF'
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+          export HOME=/root
+          export PS1='zenos~# '
+          EOF
+
+          cat > root/init.c <<'EOF'
+          #include <unistd.h>
+          #include <sys/mount.h>
+          #include <sys/wait.h>
+          #include <stdlib.h>
+
+          static void m(const char *s,const char *p,const char *t)
+          {
+              mkdir(p,0755);
+              mount(s,p,t,0,0);
+          }
+
+          int main(void)
+          {
+              if(getpid()!=1) return 1;
+
+              m("proc","/proc","proc");
+              m("sysfs","/sys","sysfs");
+              m("devtmpfs","/dev","devtmpfs");
+              m("tmpfs","/run","tmpfs");
+              m("tmpfs","/tmp","tmpfs");
+
+              {
+                  char *a[]={"/bin/busybox","--install","-s",0};
+                  pid_t p=fork();
+                  if(!p) {
+                      execv(a[0],a);
+                      _exit(127);
+                  }
+                  waitpid(p,0);
+              }
+
+              setenv("PATH",
+                     "/bin:/sbin:/usr/bin:/usr/sbin",1);
+              setenv("HOME","/root",1);
+              setenv("PS1","zenos~# ",1);
+
+              for(;;)
+              {
+                  char *a[]={"/bin/sh","-l",0};
+                  pid_t p=fork();
+
+                  if(!p) {
+                      execv(a[0],a);
+                      _exit(127);
+                  }
+
+                  waitpid(p,0);
+              }
+
+              return 0;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc -static -O2 \
+            root/init.c -o root/init
+
+          chmod 755 root/init
+
+      - name: TPK loader
+        run: |
+          cat > root/tpk.c <<'EOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <dirent.h>
+          #include <string.h>
+          #include <limits.h>
+
+          static int find(const char *d,char *o)
+          {
+              DIR *x=opendir(d);
+              if(!x) return -1;
+
+              struct dirent *e;
+
+              while((e=readdir(x)))
+              {
+                  if(e->d_name[0]=='.') continue;
+
+                  char p[PATH_MAX];
+                  snprintf(p,sizeof(p),"%s/%s",d,e->d_name);
+
+                  struct stat s;
+                  if(stat(p,&s)) continue;
+
+                  if(S_ISDIR(s.st_mode) && !find(p,o))
+                  {
+                      closedir(x);
+                      return 0;
+                  }
+
+                  if(S_ISREG(s.st_mode) &&
+                     (s.st_mode&0111))
+                  {
+                      FILE *f=fopen(p,"rb");
+                      unsigned char h[4]={0};
+
+                      if(f && fread(h,1,4,f)==4 &&
+                         h[0]==0x7f &&
+                         h[1]=='E' &&
+                         h[2]=='L' &&
+                         h[3]=='F')
+                      {
+                          fclose(f);
+                          strncpy(o,p,PATH_MAX-1);
+                          closedir(x);
+                          return 0;
+                      }
+
+                      if(f) fclose(f);
+                  }
+              }
+
+              closedir(x);
+              return -1;
+          }
+
+          int main(int n,char **v)
+          {
+              if(n!=2)
+              {
+                  fprintf(stderr,"usage: tpk app.tpk\n");
+                  return 2;
+              }
+
+              char d[PATH_MAX],e[PATH_MAX];
+
+              snprintf(d,sizeof(d),"/tmp/tpk-%d",getpid());
+              mkdir(d,0700);
+
+              pid_t p=fork();
+
+              if(!p)
+              {
+                  execl("/bin/busybox","busybox",
+                        "unzip","-o",v[1],"-d",d,0);
+                  _exit(127);
+              }
+
+              int s;
+              waitpid(p,&s,0);
+
+              if(!WIFEXITED(s)||WEXITSTATUS(s))
+              {
+                  fprintf(stderr,"TPK: bad ZIP\n");
+                  return 3;
+              }
+
+              if(find(d,e))
+              {
+                  fprintf(stderr,"TPK: no ELF\n");
+                  return 4;
+              }
+
+              printf("TPK: %s\n",e);
+              execl(e,e,0);
+              return 5;
+          }
+          EOF
+
+          aarch64-linux-gnu-gcc -static -O2 \
+            root/tpk.c -o root/usr/bin/zenos-tpk
+
+          chmod 755 root/usr/bin/zenos-tpk
+
+          cat > root/usr/bin/tpk <<'EOF'
+          #!/bin/sh
+          exec /usr/bin/zenos-tpk "$1"
+          EOF
+
+          chmod 755 root/usr/bin/tpk
+
+      - name: Linux
+        run: |
+          cd linux
+          make ARCH=arm64 defconfig
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          ./scripts/config --enable CONFIG_BLK_DEV_INITRD
+          ./scripts/config --enable CONFIG_TMPFS
+          ./scripts/config --enable CONFIG_VIRTIO
+          ./scripts/config --enable CONFIG_VIRTIO_PCI
+          ./scripts/config --enable CONFIG_VIRTIO_NET
+          ./scripts/config --enable CONFIG_DRM
+          ./scripts/config --enable CONFIG_DRM_SIMPLEDRM
+          ./scripts/config --enable CONFIG_FB
+          ./scripts/config --enable CONFIG_FB_SIMPLE
+          make ARCH=arm64 olddefconfig
+          make -j$(nproc) ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- Image
+
+      - name: Image
+        run: |
+          cd root
+          find . -print0 |
+            cpio --null -o -H newc |
+            gzip -9 > ../zenos.img
+
+          cd ..
+          mkdir release
+          cp linux/arch/arm64/boot/Image release/
+          cp zenos.img release/
+          sha256sum release/* > release/SHA256SUMS
+
+      - name: QEMU boot test
+        timeout-minutes: 2
+        run: |
+          timeout 30 qemu-system-aarch64 \
+            -M virt \
+            -cpu cortex-a57 \
+            -m 512 \
+            -kernel linux/arch/arm64/boot/Image \
+            -initrd zenos.img \
+            -append "console=ttyAMA0 rdinit=/init" \
+            -nographic || test $? -eq 124
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZenOS-ARM64
+          path: release/
