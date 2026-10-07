@@ -1,0 +1,247 @@
+name: Build zenOS ARM64
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu bc bison flex \
+            libssl-dev libncurses-dev wget cpio qemu-system-arm qemu-utils zip unzip
+
+      - name: Download BusyBox ARM64
+        run: |
+          set -e
+          mkdir -p zenos-rootfs/bin
+          wget -q -O zenos-rootfs/bin/busybox \
+            https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu
+          chmod +x zenos-rootfs/bin/busybox
+          ls -la zenos-rootfs/bin/busybox
+          file zenos-rootfs/bin/busybox
+
+      - name: Build Linux Kernel (ARM64)
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/torvalds/linux.git
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          ./scripts/config \
+            -e CONFIG_FRAMEBUFFER_CONSOLE \
+            -e CONFIG_FB \
+            -e CONFIG_VT \
+            -e CONFIG_INPUT_EVDEV \
+            -e CONFIG_FB_SIMPLE \
+            -e CONFIG_FONTS \
+            -e CONFIG_FONT_8x8 \
+            -e CONFIG_FONT_8x16 \
+            -e CONFIG_VT_CONSOLE \
+            -e CONFIG_DRM \
+            -e CONFIG_DRM_KMS_HELPER \
+            -e CONFIG_DRM_FBDEV_EMULATION \
+            -e CONFIG_DRM_VIRTIO_GPU \
+            -e CONFIG_FB_EFI \
+            -e CONFIG_SERIAL_AMBA_PL011 \
+            -e CONFIG_SERIAL_AMBA_PL011_CONSOLE
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules
+          cp arch/arm64/boot/Image ../kernel.img
+          cd ..
+          echo "=== Kernel built ==="
+          ls -la kernel.img
+          file kernel.img
+          [ -s kernel.img ] || (echo "ERROR: kernel.img is empty" && exit 1)
+
+      - name: Create init.c
+        run: |
+          set -e
+          cat > init.c << 'INITEOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <sys/mount.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          #include <linux/fb.h>
+          #define FB_PATH "/dev/fb0"
+          #define TPK_DIR "/tpk"
+          struct tpk_app { char name[256]; char exec[512]; };
+          static struct tpk_app apps[32];
+          static int app_count = 0;
+          static void fb_clear(void *fbp, int w, int h, int bpp){memset(fbp,0,(size_t)w*h*(bpp/8));}
+          static void fb_rect(void *fbp, int w, int h, int bpp, int x, int y, int rw, int rh, uint32_t c){
+            int px=bpp/8; uint8_t *b=(uint8_t*)fbp;
+            for(int j=y;j<y+rh&&j<h;j++)for(int i=x;i<x+rw&&i<w;i++){uint32_t*p=(uint32_t*)(b+(j*w+i)*px);*p=c;}
+          }
+          static const unsigned char F[95][8]={{0},{0x18,0x18,0x18,0x18,0,0,0x18},{0x36,0x36},{0x36,0x36,0x7F,0x36,0x7F,0x36,0x36},
+          {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C},{0,0x63,0x33,0x18,0x0C,0x66,0x63},{0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E},{0x06,0x06,0x03},
+          {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18},{0x06,0x0C,0x18,0x18,0x18,0x0C,0x06},{0x66,0x3C,0xFF,0x3C,0x66},{0x0C,0x0C,0x3F,0x0C,0x0C},
+          {0x0C,0x0C,0x06},{0x3F},{0x0C,0x0C},{0x60,0x30,0x18,0x0C,0x06,0x03,0x01},{0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E},
+          {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F},{0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F},{0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E},
+          {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78},{0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E},{0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E},
+          {0x3F,0x30,0x18,0x0C,0x06,0x06,0x06},{0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E},{0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E},
+          {0x0C,0x0C},{0x0C,0x0C,0x06},{0x18,0x0C,0x06,0x03,0x06,0x0C,0x18},{0x3F,0x3F},{0x06,0x0C,0x18,0x30,0x18,0x0C,0x06},
+          {0x1E,0x33,0x30,0x18,0x0C,0x0C,0x0C},{0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E},{0x0F,0x18,0x30,0x3E,0x33,0x33,0x33},
+          {0x1F,0x33,0x33,0x1F,0x33,0x33,0x1F},{0x1E,0x33,0x03,0x03,0x03,0x33,0x1E},{0x0F,0x1B,0x33,0x33,0x33,0x1B,0x0F},
+          {0x3F,0x03,0x03,0x1F,0x03,0x03,0x3F},{0x3F,0x03,0x03,0x1F,0x03,0x03,0x03},{0x1E,0x33,0x03,0x3F,0x33,0x33,0x3E},
+          {0x33,0x33,0x33,0x3F,0x33,0x33,0x33},{0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E},{0x3C,0x18,0x18,0x18,0x18,0x1B,0x0E},
+          {0x33,0x1B,0x0F,0x07,0x0F,0x1B,0x33},{0x03,0x03,0x03,0x03,0x03,0x03,0x3F},{0x33,0x77,0x55,0x55,0x41,0x41,0x41},
+          {0x33,0x3B,0x3F,0x37,0x33,0x33,0x33},{0x1E,0x33,0x33,0x33,0x33,0x33,0x1E},{0x1F,0x33,0x33,0x1F,0x03,0x03,0x03},
+          {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38},{0x1F,0x33,0x33,0x1F,0x0F,0x1B,0x33},{0x1E,0x33,0x03,0x1E,0x30,0x33,0x1E},
+          {0x3F,0x2C,0x0C,0x0C,0x0C,0x0C,0x1E},{0x33,0x33,0x33,0x33,0x33,0x33,0x1E},{0x33,0x33,0x33,0x33,0x33,0x1E,0x0C},
+          {0x41,0x41,0x41,0x49,0x49,0x49,0x36},{0x33,0x33,0x1E,0x0C,0x1E,0x33,0x33},{0x33,0x33,0x33,0x1E,0x0C,0x0C,0x0C},
+          {0x7F,0x63,0x31,0x18,0x0C,0x67,0x7F},{0x3F,0x30,0x30,0x1E,0x03,0x03,0x3F},{0x01,0x03,0x06,0x0C,0x18,0x30,0x20},
+          {0x3F,0x03,0x03,0x0E,0x18,0x18,0x0F},{0x08,0x1C,0x36,0x63},{0xFF},{0x0C,0x0C,0x06},{0x1E,0x30,0x3E,0x33,0x6E},
+          {0x03,0x03,0x1F,0x33,0x33,0x33,0x1F},{0x1E,0x33,0x03,0x33,0x1E},{0x30,0x30,0x3E,0x33,0x33,0x33,0x3E},
+          {0x1E,0x33,0x3F,0x03,0x1E},{0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F},{0x1E,0x33,0x33,0x3E,0x30,0x1F},
+          {0x03,0x03,0x1F,0x33,0x33,0x33,0x33},{0x0E,0x0C,0x0C,0x0C,0x0C,0x1E},{0x30,0x30,0x30,0x33,0x1E},{0x03,0x03,0x33,0x1B,0x0F,0x1B,0x33},
+          {0x0E,0x0C,0x0C,0x0C,0x0C,0x1E},{0x33,0x77,0x55,0x41,0x41},{0x1F,0x33,0x33,0x33,0x33},{0x1E,0x33,0x33,0x33,0x1E},
+          {0x1F,0x33,0x33,0x1F,0x03,0x03},{0x3E,0x33,0x33,0x3E,0x30,0x30},{0x1B,0x37,0x07,0x03,0x03},{0x3E,0x33,0x07,0x1E,0x38,0x1E},
+          {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18},{0x33,0x33,0x33,0x33,0x6E},{0x33,0x33,0x33,0x1E,0x0C},{0x41,0x41,0x49,0x55,0x36},
+          {0x33,0x1E,0x0C,0x1E,0x33},{0x33,0x33,0x33,0x3E,0x30,0x1F},{0x3F,0x1C,0x0C,0x0C,0x3F},{0x1C,0x18,0x18,0x0E,0x18,0x18,0x1C},
+          {0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C},{0x0E,0x18,0x18,0x38,0x18,0x18,0x0E},{0x6E,0x3B}};
+          static void fb_text(void *fbp,int w,int h,int bpp,int x,int y,const char*t,uint32_t c){
+            int l=strlen(t),px=bpp/8;uint8_t*b=(uint8_t*)fbp;
+            for(int n=0;n<l;n++){unsigned char ch=t[n];if(ch<32||ch>126)ch='?';
+            for(int r=0;r<8;r++){unsigned char bits=F[ch-32][r];for(int col=0;col<8;col++){
+              if(bits&(0x80>>col)){int xx=x+n*8+col,yy=y+r;
+              if(xx>=0&&xx<w&&yy>=0&&yy<h){uint32_t*p=(uint32_t*)(b+(yy*w+xx)*px);*p=c;}}}}}
+          }
+          static void scan_tpks(){DIR*d=opendir(TPK_DIR);if(!d)return;struct dirent*e;app_count=0;
+            while((e=readdir(d))&&app_count<32){if(strstr(e->d_name,".tpk")){
+              snprintf(apps[app_count].name,256,"%s",e->d_name);
+              snprintf(apps[app_count].exec,512,TPK_DIR"/%s",e->d_name);app_count++;}}closedir(d);}
+          static void draw_ui(void*fbp,int W,int H,int B){
+            fb_clear(fbp,W,H,B);
+            fb_rect(fbp,W,H,B,0,0,W,40,0xFF1A1A2E);
+            fb_text(fbp,W,H,B,10,16,"zenOS",0xFFFFFFFF);
+            fb_text(fbp,W,H,B,W-100,16,"ARM64",0xFF00D4FF);
+            scan_tpks();
+            for(int i=0;i<app_count;i++){int col=i%2,row=i/2;int x=20+col*(W/2-20),y=80+row*100;
+              fb_rect(fbp,W,H,B,x,y,W/2-40,80,0xFF0F4C75);fb_text(fbp,W,H,B,x+8,y+36,apps[i].name,0xFFFFFFFF);}
+            if(!app_count)fb_text(fbp,W,H,B,20,H/2,"No TPK apps. Drop .tpk in /tpk",0xFFFFFFAA);
+            fb_rect(fbp,W,H,B,0,H-40,W,40,0xFF1A1A2E);
+            fb_text(fbp,W,H,B,10,H-28,"zenos~# ready | TPK Loader v1",0xFFFFFFFF);
+          }
+          int main(void){
+            mount("proc","/proc","proc",0,NULL);mount("sysfs","/sys","sysfs",0,NULL);
+            mount("devtmpfs","/dev","devtmpfs",0,NULL);mkdir("/dev/pts",0755);
+            mount("devpts","/dev/pts","devpts",0,NULL);mkdir("/tmp",01777);mkdir(TPK_DIR,0755);
+            if(fork()==0){setsid();int fd=open("/dev/console",O_RDWR);if(fd>=0){dup2(fd,0);dup2(fd,1);dup2(fd,2);
+              if(fd>2)close(fd);ioctl(0,0x540E,1);}setenv("PS1","zenos~# ",1);execl("/bin/busybox","sh","-i",NULL);exit(1);}
+            int fd=open(FB_PATH,O_RDWR);void*fbp=NULL;int W=0,H=0,B=0;
+            if(fd>=0){struct fb_var_screeninfo v;if(ioctl(fd,0x4600,&v)==0){W=v.xres;H=v.yres;B=v.bits_per_pixel;
+              long sz=(long)W*H*B/8;fbp=mmap(0,sz,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+              if(fbp==MAP_FAILED)fbp=NULL;else{draw_ui(fbp,W,H,B);munmap(fbp,sz);}}}
+            if(fd>=0)close(fd);
+            while(1){int s;while(waitpid(-1,&s,WNOHANG)>0);sleep(3);}return 0;
+          }
+          INITEOF
+          aarch64-linux-gnu-gcc -O2 -static -o zenos-rootfs/init init.c
+          chmod +x zenos-rootfs/init
+          ls -la zenos-rootfs/init
+          file zenos-rootfs/init
+
+      - name: Build initramfs
+        run: |
+          set -e
+          cd zenos-rootfs
+          mkdir -p dev proc sys tmp tpk
+          ln -sf bin/busybox bin/sh
+          ln -sf bin/busybox bin/ls
+          ln -sf bin/busybox bin/cat
+          ln -sf bin/busybox bin/mkdir
+          ln -sf bin/busybox bin/unzip
+          ln -sf bin/busybox bin/mount
+          ln -sf bin/busybox bin/chmod
+          mkdir -p tpk/demo.tpk/shared/res
+          cat > tpk/demo.tpk/shared/res/entry.sh << 'TPK'
+          #!/bin/sh
+          echo "Hello from zenOS TPK!"
+          sleep 3
+          TPK
+          chmod +x tpk/demo.tpk/shared/res/entry.sh
+          cd tpk/demo.tpk && zip -r ../../demo.tpk . && cd ../..
+          rm -rf tpk/demo.tpk
+          mv demo.tpk tpk/ 2>/dev/null || true
+          echo "=== Before cpio ==="
+          find . | head -20
+          find . | cpio -H newc -o > ../initramfs.cpio
+          gzip -9 < ../initramfs.cpio > ../initramfs.img
+          cd ..
+          echo "=== Initramfs built ==="
+          ls -la initramfs.img
+          file initramfs.img
+          [ -s initramfs.img ] || (echo "ERROR: initramfs.img is empty" && exit 1)
+
+      - name: Create disk image
+        run: |
+          set -e
+          echo "=== Creating zenos.img ==="
+          ls -la kernel.img initramfs.img
+          dd if=/dev/zero of=zenos.img bs=1M count=64 status=none
+          ls -la zenos.img
+          mkfs.ext4 -F zenos.img
+          mkdir -p mnt
+          sudo mount -o loop zenos.img mnt
+          sudo cp kernel.img initramfs.img mnt/
+          sudo sync
+          echo "=== Files in mnt ==="
+          sudo ls -la mnt/
+          sudo umount mnt
+          echo "=== zenos.img final ==="
+          ls -la zenos.img
+          [ -s zenos.img ] || (echo "ERROR: zenos.img is empty" && exit 1)
+          gzip -k zenos.img
+          ls -la zenos.img*
+
+      - name: Verify all artifacts
+        run: |
+          set -e
+          echo "=== Final verification ==="
+          ls -la kernel.img initramfs.img zenos.img zenos.img.gz
+          file kernel.img initramfs.img zenos.img
+          echo "Kernel size: $(stat -c%s kernel.img) bytes"
+          echo "Initramfs size: $(stat -c%s initramfs.img) bytes"
+          echo "Disk img size: $(stat -c%s zenos.img) bytes"
+          # Sanity: kernel must be > 1MB, initramfs > 100KB, img > 60MB
+          [ $(stat -c%s kernel.img) -gt 1000000 ] || (echo "Kernel too small" && exit 1)
+          [ $(stat -c%s initramfs.img) -gt 100000 ] || (echo "Initramfs too small" && exit 1)
+          [ $(stat -c%s zenos.img) -gt 60000000 ] || (echo "Disk image too small" && exit 1)
+          echo "All artifacts OK!"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenos-arm64
+          path: |
+            zenos.img.gz
+            zenos.img
+            kernel.img
+            initramfs.img
+          if-no-files-found: error
+
+      - name: Quick QEMU smoke test
+        run: |
+          timeout 20 qemu-system-aarch64 \
+            -M virt -cpu cortex-a57 -m 512 \
+            -kernel kernel.img -initrd initramfs.img \
+            -append "console=ttyAMA0 rdinit=/init" \
+            -nographic -serial mon:stdio \
+            -no-reboot || true
