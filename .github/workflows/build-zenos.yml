@@ -1,0 +1,1352 @@
+name: Build zenOS HYPER (Fixed)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu bc bison flex \
+            libssl-dev libncurses-dev wget cpio zip unzip xz-utils
+
+      - name: Download BusyBox
+        run: |
+          mkdir -p zenos-rootfs/bin
+          wget -q -O zenos-rootfs/bin/busybox \
+            https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu
+          chmod +x zenos-rootfs/bin/busybox
+
+      - name: Build Kernel
+        run: |
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.51.tar.xz
+          tar xf linux-6.12.51.tar.xz
+          cd linux-6.12.51
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          ./scripts/config \
+            -e CONFIG_FB -e CONFIG_FB_SIMPLE -e CONFIG_FRAMEBUFFER_CONSOLE \
+            -e CONFIG_VT -e CONFIG_VT_CONSOLE -e CONFIG_INPUT_EVDEV \
+            -e CONFIG_INPUT_KEYBOARD -e CONFIG_INPUT_MOUSE -e CONFIG_INPUT_MISC \
+            -e CONFIG_DRM -e CONFIG_DRM_VIRTIO_GPU -e CONFIG_DRM_FBDEV_EMULATION \
+            -e CONFIG_FONTS -e CONFIG_FONT_8x16 \
+            -e CONFIG_VIRTIO_PCI -e CONFIG_VIRTIO_INPUT \
+            -e CONFIG_USB -e CONFIG_USB_XHCI_HCD -e CONFIG_USB_EHCI_HCD \
+            -e CONFIG_USB_HID -e CONFIG_HID -e CONFIG_HID_GENERIC \
+            -e CONFIG_SERIAL_AMBA_PL011 -e CONFIG_SERIAL_AMBA_PL011_CONSOLE \
+            -e CONFIG_HIGH_RES_TIMERS -e CONFIG_NO_HZ -e CONFIG_HZ_1000 \
+            -e CONFIG_TMPFS -e CONFIG_TMPFS_POSIX_ACL -e CONFIG_UTS_NS
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+          cp arch/arm64/boot/Image ../kernel.img
+
+      - name: Write FIXED init.c (no conflicting vars, proper fscanf)
+        run: |
+          cat > zenos-rootfs/init.c << 'CEOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <time.h>
+          #include <ctype.h>
+          #include <signal.h>
+          #include <errno.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <sys/mount.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          #include <sys/select.h>
+          #include <sys/utsname.h>
+          #include <linux/fb.h>
+          #include <linux/input.h>
+          #include <linux/vt.h>
+          #include <linux/kd.h>
+          #include <sys/statvfs.h>
+
+          #define MAX_APPS 64
+          #define TPK_DIR "/tpk"
+          #define APPS_DIR "/var/apps"
+
+          static uint32_t *fb_front=NULL, *fb_back=NULL;
+          static int W=800, H=480;
+          static size_t fb_size=0;
+
+          static int input_fds[16];
+          static int n_inputs=0;
+          static int touch_x=400, touch_y=240;
+          static int touch_down=0, last_touch_down=0;
+          static int abs_x_min=0, abs_x_max=32767;
+          static int abs_y_min=0, abs_y_max=32767;
+          static int has_abs_x=0, has_abs_y=0;
+          static int pending_x=-1, pending_y=-1;
+
+          static int active_app=-1;
+
+          typedef struct {
+              char name[64];
+              char dir[256];
+              uint32_t color1, color2;
+              char icon_letter;
+              char ui[65536];
+              int ui_valid;
+          } app_t;
+          static app_t apps[MAX_APPS];
+          static int n_apps=0;
+
+          static void klog(const char *fmt, ...) {
+              static int fd=-1;
+              if (fd<0) fd=open("/dev/kmsg", O_WRONLY|O_NOCTTY);
+              if (fd<0) return;
+              char buf[256];
+              va_list ap; va_start(ap, fmt);
+              vsnprintf(buf, sizeof(buf), fmt, ap);
+              va_end(ap);
+              dprintf(fd, "<6>zenOS: %s\n", buf);
+          }
+
+          static const uint8_t font8x16[95][16]={
+            {0},{0x18,0x18,0x18,0x18,0x18,0,0x18},{0x6C,0x6C,0x6C},
+            {0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C},{0x18,0x3E,0x60,0x3C,0x06,0x7C,0x18},
+            {0,0x66,0x6C,0x18,0x30,0x66,0x46},{0x38,0x6C,0x38,0x76,0xDC,0xCC,0x76},
+            {0x18,0x18,0x30},{0x0C,0x18,0x30,0x30,0x30,0x18,0x0C},
+            {0x30,0x18,0x0C,0x0C,0x0C,0x18,0x30},{0,0x66,0x3C,0xFF,0x3C,0x66},
+            {0,0x18,0x18,0x7E,0x18,0x18},{0,0,0,0,0,0x18,0x18,0x30},
+            {0,0,0,0x7E},{0,0,0,0,0,0x18,0x18},{0x06,0x0C,0x18,0x30,0x60,0xC0,0x80},
+            {0x3C,0x66,0x6E,0x7E,0x76,0x66,0x3C},{0x18,0x38,0x18,0x18,0x18,0x18,0x7E},
+            {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E},{0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C},
+            {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C},{0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C},
+            {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C},{0x7E,0x06,0x0C,0x18,0x30,0x30,0x30},
+            {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C},{0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38},
+            {0,0x18,0x18,0,0,0x18,0x18},{0,0x18,0x18,0,0,0x18,0x18,0x30},
+            {0x0C,0x18,0x30,0x60,0x30,0x18,0x0C},{0,0,0x7E,0,0x7E},
+            {0x30,0x18,0x0C,0x06,0x0C,0x18,0x30},{0x3C,0x66,0x0C,0x18,0x18,0,0x18},
+            {0x3C,0x66,0x6E,0x6E,0x60,0x60,0x3C},{0x18,0x3C,0x66,0x66,0x7E,0x66,0x66},
+            {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C},{0x3C,0x66,0x60,0x60,0x60,0x66,0x3C},
+            {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78},{0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E},
+            {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60},{0x3C,0x66,0x60,0x6E,0x66,0x66,0x3E},
+            {0x66,0x66,0x66,0x7E,0x66,0x66,0x66},{0x3C,0x18,0x18,0x18,0x18,0x18,0x3C},
+            {0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38},{0x66,0x6C,0x78,0x70,0x78,0x6C,0x66},
+            {0x60,0x60,0x60,0x60,0x60,0x60,0x7E},{0x63,0x77,0x7F,0x6B,0x63,0x63,0x63},
+            {0x66,0x66,0x76,0x7E,0x7E,0x6E,0x66},{0x3C,0x66,0x66,0x66,0x66,0x66,0x3C},
+            {0x7C,0x66,0x66,0x7C,0x60,0x60,0x60},{0x3C,0x66,0x66,0x66,0x66,0x6E,0x3C,0x06},
+            {0x7C,0x66,0x66,0x7C,0x6C,0x66,0x66},{0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C},
+            {0x7E,0x18,0x18,0x18,0x18,0x18,0x18},{0x66,0x66,0x66,0x66,0x66,0x66,0x3C},
+            {0x66,0x66,0x66,0x66,0x66,0x3C,0x18},{0x63,0x63,0x63,0x6B,0x7F,0x77,0x63},
+            {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66},{0x66,0x66,0x66,0x3C,0x18,0x18,0x18},
+            {0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E},{0x3C,0x30,0x30,0x30,0x30,0x30,0x3C},
+            {0x60,0x30,0x18,0x0C,0x06,0x03,0x01},{0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C},
+            {0x18,0x3C,0x66},{0,0,0,0,0,0,0,0xFE},{0x18,0x18},
+            {0,0,0x3C,0x06,0x3E,0x66,0x3E},{0x60,0x60,0x7C,0x66,0x66,0x66,0x7C},
+            {0,0,0x3C,0x66,0x60,0x66,0x3C},{0x06,0x06,0x3E,0x66,0x66,0x66,0x3E},
+            {0,0,0x3C,0x66,0x7E,0x60,0x3C},{0x1C,0x30,0x7C,0x30,0x30,0x30,0x30},
+            {0,0,0x3E,0x66,0x66,0x3E,0x06,0x3C},{0x60,0x60,0x7C,0x66,0x66,0x66,0x66},
+            {0x18,0,0x38,0x18,0x18,0x18,0x3C},{0x0C,0,0x1C,0x0C,0x0C,0x0C,0x6C,0x38},
+            {0x60,0x60,0x66,0x6C,0x78,0x6C,0x66},{0x38,0x18,0x18,0x18,0x18,0x18,0x3C},
+            {0,0,0x76,0x7F,0x6B,0x63,0x63},{0,0,0x7C,0x66,0x66,0x66,0x66},
+            {0,0,0x3C,0x66,0x66,0x66,0x3C},{0,0,0x7C,0x66,0x66,0x7C,0x60,0x60},
+            {0,0,0x3E,0x66,0x66,0x3E,0x06,0x06},{0,0,0x6C,0x76,0x60,0x60,0x60},
+            {0,0,0x3E,0x60,0x3C,0x06,0x7C},{0x30,0x30,0x7C,0x30,0x30,0x30,0x1C},
+            {0,0,0x66,0x66,0x66,0x66,0x3E},{0,0,0x66,0x66,0x66,0x3C,0x18},
+            {0,0,0x63,0x63,0x6B,0x7F,0x36},{0,0,0x66,0x3C,0x18,0x3C,0x66},
+            {0,0,0x66,0x66,0x66,0x3E,0x06,0x3C},{0,0,0x7E,0x0C,0x18,0x30,0x7E},
+            {0x0C,0x18,0x18,0x30,0x18,0x18,0x0C},{0x18,0x18,0x18,0,0x18,0x18,0x18},
+            {0x30,0x18,0x18,0x0C,0x18,0x18,0x30},{0,0x76,0xDC}
+          };
+
+          static inline void px(int x, int y, uint32_t c) {
+              if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H)
+                  fb_back[y * W + x] = c;
+          }
+
+          static void fill_rect(int x, int y, int w, int h, uint32_t c) {
+              if (x < 0) { w += x; x = 0; }
+              if (y < 0) { h += y; y = 0; }
+              if (x + w > W) w = W - x;
+              if (y + h > H) h = H - y;
+              if (w <= 0 || h <= 0) return;
+              uint32_t *p = fb_back + y * W + x;
+              for (int j = 0; j < h; j++) {
+                  uint32_t *row = p + j * W;
+                  for (int i = 0; i < w; i++) row[i] = c;
+              }
+          }
+
+          static void rrect(int x, int y, int w, int h, int r, uint32_t c) {
+              if (r > w/2) r = w/2;
+              if (r > h/2) r = h/2;
+              fill_rect(x + r, y, w - 2*r, h, c);
+              fill_rect(x, y + r, r, h - 2*r, c);
+              fill_rect(x + w - r, y + r, r, h - 2*r, c);
+              for (int j = -r; j <= r; j++)
+                  for (int i = -r; i <= r; i++)
+                      if (i*i + j*j <= r*r) {
+                          px(x + r + i, y + r + j, c);
+                          px(x + w - r - 1 + i, y + r + j, c);
+                          px(x + r + i, y + h - r - 1 + j, c);
+                          px(x + w - r - 1 + i, y + h - r - 1 + j, c);
+                      }
+          }
+
+          static void dchar(int x, int y, char ch, int s, uint32_t c) {
+              if (ch < 32 || ch > 126) ch = '?';
+              const uint8_t *g = font8x16[ch - 32];
+              for (int row = 0; row < 16; row++)
+                  for (int col = 0; col < 8; col++)
+                      if (g[row] & (0x80 >> col))
+                          for (int sy = 0; sy < s; sy++)
+                              for (int sx = 0; sx < s; sx++)
+                                  px(x + col*s + sx, y + row*s + sy, c);
+          }
+
+          static void dstr(int x, int y, const char *s, int sc, uint32_t c) {
+              int cx = x;
+              for (int i = 0; s[i]; i++) {
+                  if (s[i] == '\n') { cx = x; y += 16*sc + 2; continue; }
+                  dchar(cx, y, s[i], sc, c);
+                  cx += 8*sc;
+              }
+          }
+
+          static int strw(const char *s, int sc) { return strlen(s) * 8 * sc; }
+
+          static void cmd_ls(const char *path, char *out, int sz) {
+              out[0] = 0;
+              DIR *d = opendir(path);
+              if (!d) { snprintf(out, sz, "Cannot open %s", path); return; }
+              struct dirent *e;
+              int pos = 0;
+              while ((e = readdir(d)) != NULL && pos < sz - 200) {
+                  char full[512];
+                  snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+                  struct stat st;
+                  if (stat(full, &st) == 0) {
+                      char type = S_ISDIR(st.st_mode) ? 'd' : '-';
+                      int len = snprintf(out + pos, sz - pos,
+                          "%c %7ld %s\n", type, (long)st.st_size, e->d_name);
+                      if (len > 0) pos += len;
+                  }
+              }
+              closedir(d);
+          }
+
+          static void cmd_ps(char *out, int sz) {
+              out[0] = 0;
+              int pos = snprintf(out, sz, "PID   CMD\n");
+              DIR *d = opendir("/proc");
+              if (!d) return;
+              struct dirent *e;
+              while ((e = readdir(d)) != NULL && pos < sz - 200) {
+                  if (!isdigit(e->d_name[0])) continue;
+                  char path[256];
+                  snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+                  FILE *f = fopen(path, "r");
+                  if (f) {
+                      char name[64] = {0};
+                      if (fgets(name, sizeof(name), f)) {
+                          name[strcspn(name, "\n")] = 0;
+                          pos += snprintf(out + pos, sz - pos, "%-5s %s\n", e->d_name, name);
+                      }
+                      fclose(f);
+                  }
+              }
+              closedir(d);
+          }
+
+          static void cmd_df(char *out, int sz) {
+              out[0] = 0;
+              struct statvfs st;
+              int pos = snprintf(out, sz, "Mount      Size    Used\n");
+              const char *mounts[] = {"/", "/tmp", "/var", NULL};
+              for (int i = 0; mounts[i]; i++) {
+                  if (statvfs(mounts[i], &st) == 0) {
+                      unsigned long total = st.f_blocks * st.f_frsize / (1024*1024);
+                      unsigned long free_m = st.f_bfree * st.f_frsize / (1024*1024);
+                      unsigned long used = total - free_m;
+                      pos += snprintf(out + pos, sz - pos, "%-10s %4luM   %4luM\n",
+                          mounts[i], total, used);
+                  }
+              }
+          }
+
+          static void cmd_uname(char *out, int sz) {
+              struct utsname u;
+              if (uname(&u) == 0) {
+                  snprintf(out, sz, "%s %s %s %s %s",
+                      u.sysname, u.nodename, u.release, u.version, u.machine);
+              } else {
+                  snprintf(out, sz, "uname failed");
+              }
+          }
+
+          static void cmd_meminfo(char *out, int sz) {
+              FILE *f = fopen("/proc/meminfo", "r");
+              if (!f) { snprintf(out, sz, "Cannot open /proc/meminfo"); return; }
+              size_t r = fread(out, 1, sz - 1, f);
+              out[r] = 0;
+              fclose(f);
+          }
+
+          static void cmd_date(char *out, int sz) {
+              time_t t = time(NULL);
+              struct tm *tm = localtime(&t);
+              strftime(out, sz, "%Y-%m-%d %H:%M:%S %Z", tm);
+          }
+
+          static void cmd_uptime(char *out, int sz) {
+              FILE *f = fopen("/proc/uptime", "r");
+              if (!f) { snprintf(out, sz, "?"); return; }
+              double up = 0, idle = 0;
+              if (fscanf(f, "%lf %lf", &up, &idle) == 2) {
+                  int days = (int)(up / 86400);
+                  int hours = (int)(up / 3600) % 24;
+                  int mins = (int)(up / 60) % 60;
+                  snprintf(out, sz, "Up: %dd %dh %dm", days, hours, mins);
+              }
+              fclose(f);
+          }
+
+          static void cmd_dmesg(char *out, int sz) {
+              out[0] = 0;
+              FILE *f = fopen("/dev/kmsg", "r");
+              if (!f) { snprintf(out, sz, "Cannot read kmsg"); return; }
+              char lines[32][128];
+              int idx = 0, count = 0;
+              char line[256];
+              int max_reads = 200;
+              while (max_reads-- > 0 && fgets(line, sizeof(line), f)) {
+                  strncpy(lines[idx], line, 127);
+                  lines[idx][127] = 0;
+                  char *nl = strchr(lines[idx], '\n');
+                  if (nl) *nl = 0;
+                  idx = (idx + 1) % 32;
+                  if (count < 32) count++;
+              }
+              fclose(f);
+              int pos = 0;
+              for (int i = 0; i < count; i++) {
+                  int real_idx = (idx - count + i + 32) % 32;
+                  pos += snprintf(out + pos, sz - pos, "%.80s\n", lines[real_idx]);
+              }
+              if (pos == 0) snprintf(out, sz, "(no dmesg)");
+          }
+
+          static void terminal_exec(const char *cmd_name, char *out, int sz) {
+              if (strcmp(cmd_name, "ls") == 0) cmd_ls("/", out, sz);
+              else if (strcmp(cmd_name, "ps") == 0) cmd_ps(out, sz);
+              else if (strcmp(cmd_name, "df") == 0) cmd_df(out, sz);
+              else if (strcmp(cmd_name, "uname") == 0) cmd_uname(out, sz);
+              else if (strcmp(cmd_name, "mem") == 0) cmd_meminfo(out, sz);
+              else if (strcmp(cmd_name, "date") == 0) cmd_date(out, sz);
+              else if (strcmp(cmd_name, "uptime") == 0) cmd_uptime(out, sz);
+              else if (strcmp(cmd_name, "dmesg") == 0) cmd_dmesg(out, sz);
+              else if (strcmp(cmd_name, "whoami") == 0) snprintf(out, sz, "root (uid=0)");
+              else if (strcmp(cmd_name, "clear") == 0) out[0] = 0;
+              else snprintf(out, sz, "Unknown: %s", cmd_name);
+          }
+
+          typedef struct {
+              char cmd[16], id[32], text[128];
+              int x, y, w, h, size;
+              uint32_t color;
+          } ui_cmd_t;
+          static ui_cmd_t ui_cmds[256];
+          static int n_ui_cmds = 0;
+
+          static void parse_ui(const char *output) {
+              n_ui_cmds = 0;
+              const char *p = output;
+              while (*p && n_ui_cmds < 256) {
+                  while (*p && isspace(*p)) p++;
+                  if (!*p) break;
+                  ui_cmd_t *c = &ui_cmds[n_ui_cmds];
+                  memset(c, 0, sizeof(*c));
+                  char line[512];
+                  int i = 0;
+                  while (*p && *p != '\n' && i < 511) line[i++] = *p++;
+                  line[i] = 0;
+                  if (*p == '\n') p++;
+                  char *save, *tok = strtok_r(line, " \t", &save);
+                  if (!tok) continue;
+                  if (strcmp(tok, "BG") == 0) {
+                      strcpy(c->cmd, "BG");
+                      tok = strtok_r(NULL, " \t", &save);
+                      if (tok) c->color = strtoul(tok, NULL, 0);
+                  } else if (strcmp(tok, "RECT") == 0) {
+                      strcpy(c->cmd, "RECT");
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->x = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->y = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->w = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->h = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->color = strtoul(tok, NULL, 0);
+                  } else if (strcmp(tok, "TEXT") == 0) {
+                      strcpy(c->cmd, "TEXT");
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->x = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->y = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->size = atoi(tok);
+                      char *q = strchr(save, '"'); char *e = NULL;
+                      if (q) { q++; e = strchr(q, '"'); if (e) { int l = e - q; if (l > 127) l = 127; strncpy(c->text, q, l); c->text[l] = 0; } }
+                      if (q && e) { q = e + 1; while (*q == ' ' || *q == '\t') q++; if (*q) c->color = strtoul(q, NULL, 0); }
+                  } else if (strcmp(tok, "BTN") == 0) {
+                      strcpy(c->cmd, "BTN");
+                      tok = strtok_r(NULL, " \t", &save); if (tok) strncpy(c->id, tok, 31);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->x = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->y = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->w = atoi(tok);
+                      tok = strtok_r(NULL, " \t", &save); if (tok) c->h = atoi(tok);
+                      char label[64] = {0}; char *q = strchr(save ? save : "", '"'); char *e = NULL;
+                      if (q) { q++; e = strchr(q, '"'); if (e) { int l = e - q; if (l > 63) l = 63; strncpy(label, q, l); label[l] = 0; } }
+                      if (q && e) { q = e + 1; while (*q == ' ' || *q == '\t') q++; c->color = strtoul(q, NULL, 0); }
+                      snprintf(c->text, sizeof(c->text), "%s", label);
+                  }
+                  n_ui_cmds++;
+              }
+          }
+
+          static void build_terminal_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x000000\n"
+                  "TEXT 10 10 2 \"zenOS Terminal\" 0x00FF00\n"
+                  "RECT 10 40 680 1 0x008800\n"
+                  "BTN ls 10 50 80 36 \"ls\" 0x2D3436\n"
+                  "BTN ps 100 50 80 36 \"ps\" 0x2D3436\n"
+                  "BTN df 190 50 80 36 \"df\" 0x2D3436\n"
+                  "BTN uname 280 50 80 36 \"uname\" 0x2D3436\n"
+                  "BTN mem 370 50 80 36 \"mem\" 0x2D3436\n"
+                  "BTN date 460 50 80 36 \"date\" 0x2D3436\n"
+                  "BTN uptime 550 50 80 36 \"uptime\" 0x0984E3\n"
+                  "BTN dmesg 10 95 80 36 \"dmesg\" 0x6C5CE7\n"
+                  "BTN whoami 100 95 80 36 \"whoami\" 0x0984E3\n"
+                  "BTN clear 190 95 80 36 \"clear\" 0xD63031\n");
+
+              char result[8192] = {0};
+              char rpath[512];
+              snprintf(rpath, sizeof(rpath), "%s/result.txt", a->dir);
+              int fd = open(rpath, O_RDONLY);
+              if (fd >= 0) {
+                  ssize_t r = read(fd, result, sizeof(result) - 1);
+                  close(fd);
+                  if (r > 0) result[r] = 0;
+              }
+
+              int y = 140;
+              char *line = strtok(result, "\n");
+              while (line && y < 400 && pos < (int)sizeof(a->ui) - 200) {
+                  if (strlen(line) > 90) line[90] = 0;
+                  char safe[128];
+                  int si = 0;
+                  for (int i = 0; line[i] && si < 120; i++) {
+                      if (line[i] == '"') safe[si++] = '\'';
+                      else safe[si++] = line[i];
+                  }
+                  safe[si] = 0;
+                  pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                      "TEXT 10 %d 1 \"%s\" 0x00FF00\n", y, safe);
+                  y += 12;
+                  line = strtok(NULL, "\n");
+              }
+              a->ui_valid = 1;
+          }
+
+          static void build_monitor_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x0A0A1E\n"
+                  "TEXT 10 10 2 \"System Monitor\" 0x00D4FF\n");
+
+              struct utsname uts_info;  /* FIXED: renamed from 'u' */
+              if (uname(&uts_info) == 0) {
+                  pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                      "TEXT 10 40 1 \"Kernel: %s\" 0xFFFFFF\n", uts_info.release);
+              }
+
+              FILE *f = fopen("/proc/uptime", "r");
+              if (f) {
+                  double up = 0;
+                  if (fscanf(f, "%lf", &up) == 1) {  /* FIXED: check return value */
+                      int d = (int)(up/86400), h = (int)(up/3600)%24, m = (int)(up/60)%60;
+                      pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                          "TEXT 10 56 1 \"Uptime: %dd %dh %dm\" 0xFFFFFF\n", d, h, m);
+                  }
+                  fclose(f);
+              }
+
+              long total = 0, avail = 0;
+              f = fopen("/proc/meminfo", "r");
+              if (f) {
+                  char line[128];
+                  while (fgets(line, sizeof(line), f)) {
+                      if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 10, "%ld", &total);
+                      if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 14, "%ld", &avail);
+                  }
+                  fclose(f);
+              }
+              long used = total - avail;  /* FIXED: renamed from 'u' to 'used' */
+              int pct = total > 0 ? (int)(used * 100 / total) : 0;
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "TEXT 10 80 1 \"RAM: %ld/%ld MB (%d%%)\" 0xFFFFFF\n"
+                  "RECT 10 100 500 12 0x2D3436\n"
+                  "RECT 10 100 %d 12 0x00B894\n"
+                  "TEXT 10 130 1 \"Processes:\" 0xFDCB6E\n",
+                  used/1024, total/1024, pct, pct*5);
+
+              int y = 150;
+              DIR *d = opendir("/proc");
+              if (d) {
+                  struct dirent *e;
+                  int n = 0;
+                  while ((e = readdir(d)) && n < 12 && y < 340) {
+                      if (!isdigit(e->d_name[0])) continue;
+                      char pth[256];
+                      snprintf(pth, sizeof(pth), "/proc/%s/comm", e->d_name);
+                      FILE *cf = fopen(pth, "r");
+                      if (cf) {
+                          char nm[64] = {0};
+                          if (fgets(nm, sizeof(nm), cf)) {
+                              nm[strcspn(nm, "\n")] = 0;
+                              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                                  "TEXT 10 %d 1 \"[%s] %s\" 0xCCCCCC\n", y, e->d_name, nm);
+                              y += 12;
+                              n++;
+                          }
+                          fclose(cf);
+                      }
+                  }
+                  closedir(d);
+              }
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BTN refresh 10 340 120 36 \"Refresh\" 0x0984E3\n");
+              a->ui_valid = 1;
+          }
+
+          static void build_settings_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              char hn_file[512];
+              snprintf(hn_file, sizeof(hn_file), "%s/hostname", a->dir);
+              char hn[64] = "zenos";
+              FILE *f = fopen(hn_file, "r");
+              if (f) { if (fgets(hn, sizeof(hn), f)) hn[strcspn(hn, "\n")] = 0; fclose(f); }
+
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x0A0A1E\n"
+                  "TEXT 10 10 2 \"Settings\" 0x00D4FF\n"
+                  "TEXT 10 50 1 \"Hostname: %s\" 0xFFFFFF\n"
+                  "BTN h1 200 48 100 24 \"zenos\" 0x0984E3\n"
+                  "BTN h2 310 48 100 24 \"device\" 0x0984E3\n"
+                  "BTN h3 420 48 100 24 \"phone\" 0x0984E3\n", hn);
+
+              struct utsname uts_info;
+              if (uname(&uts_info) == 0) {
+                  pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                      "TEXT 10 90 1 \"Kernel: %s\" 0xFFFFFF\n"
+                      "TEXT 10 106 1 \"Arch: %s\" 0xFFFFFF\n", uts_info.release, uts_info.machine);
+              }
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BTN info 10 200 200 36 \"System Info\" 0x00B894\n"
+                  "BTN date 220 200 200 36 \"Date/Time\" 0x6C5CE7\n");
+
+              char out_file[512];
+              snprintf(out_file, sizeof(out_file), "%s/out.txt", a->dir);
+              f = fopen(out_file, "r");
+              if (f) {
+                  int y = 250;
+                  char line[128];
+                  while (fgets(line, sizeof(line), f) && y < 380) {
+                      line[strcspn(line, "\n")] = 0;
+                      if (strlen(line) > 90) line[90] = 0;
+                      char safe[128];
+                      int si = 0;
+                      for (int i = 0; line[i] && si < 120; i++) {
+                          if (line[i] == '"') safe[si++] = '\'';
+                          else safe[si++] = line[i];
+                      }
+                      safe[si] = 0;
+                      pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                          "TEXT 10 %d 1 \"%s\" 0xCCCCCC\n", y, safe);
+                      y += 12;
+                  }
+                  fclose(f);
+              }
+              a->ui_valid = 1;
+          }
+
+          static void build_calc_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              char sf[512];
+              snprintf(sf, sizeof(sf), "%s/state", a->dir);
+              char v[64] = "0";
+              FILE *f = fopen(sf, "r");
+              if (f) { if (fgets(v, sizeof(v), f)) v[strcspn(v, "\n")] = 0; fclose(f); }
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x0A0A1E\n"
+                  "TEXT 10 10 2 \"Calculator\" 0x00D4FF\n"
+                  "RECT 10 50 560 60 0x2D3436\n"
+                  "TEXT 20 60 4 \"%s\" 0x00FF00\n"
+                  "BTN c 10 130 90 60 \"C\" 0xD63031\n"
+                  "BTN d7 110 130 90 60 \"7\" 0x2D3436\n"
+                  "BTN d8 210 130 90 60 \"8\" 0x2D3436\n"
+                  "BTN d9 310 130 90 60 \"9\" 0x2D3436\n"
+                  "BTN div 410 130 90 60 \"/\" 0x0984E3\n"
+                  "BTN d4 110 200 90 60 \"4\" 0x2D3436\n"
+                  "BTN d5 210 200 90 60 \"5\" 0x2D3436\n"
+                  "BTN d6 310 200 90 60 \"6\" 0x2D3436\n"
+                  "BTN mul 410 200 90 60 \"*\" 0x0984E3\n"
+                  "BTN d1 110 270 90 60 \"1\" 0x2D3436\n"
+                  "BTN d2 210 270 90 60 \"2\" 0x2D3436\n"
+                  "BTN d3 310 270 90 60 \"3\" 0x2D3436\n"
+                  "BTN sub 410 270 90 60 \"-\" 0x0984E3\n"
+                  "BTN d0 10 340 190 40 \"0\" 0x2D3436\n"
+                  "BTN eq 210 340 90 40 \"=\" 0x00B894\n"
+                  "BTN add 310 340 90 40 \"+\" 0x0984E3\n", v);
+              a->ui_valid = 1;
+          }
+
+          static void build_files_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              char df[512];
+              snprintf(df, sizeof(df), "%s/dir", a->dir);
+              char cur[512] = "/";
+              FILE *f = fopen(df, "r");
+              if (f) { if (fgets(cur, sizeof(cur), f)) cur[strcspn(cur, "\n")] = 0; fclose(f); }
+
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x0A0A1E\n"
+                  "TEXT 10 10 2 \"Files\" 0x00D4FF\n"
+                  "TEXT 10 40 1 \"%s\" 0xFDCB6E\n"
+                  "BTN up 10 70 80 36 \"[UP]\" 0x0984E3\n"
+                  "BTN home 100 70 80 36 \"[HOME]\" 0x00B894\n"
+                  "BTN root 190 70 80 36 \"[/]\" 0x6C5CE7\n"
+                  "BTN tpk 280 70 80 36 \"[/tpk]\" 0xE17055\n", cur);
+
+              int y = 120;
+              DIR *d = opendir(cur);
+              if (d) {
+                  struct dirent *e;
+                  while ((e = readdir(d)) && y < 380) {
+                      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                      char full[1024];
+                      snprintf(full, sizeof(full), "%s/%s", cur, e->d_name);
+                      struct stat st;
+                      if (stat(full, &st) == 0) {
+                          if (S_ISDIR(st.st_mode)) {
+                              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                                  "BTN d_%s 10 %d 680 24 \"[DIR] %s\" 0x2D3436\n",
+                                  e->d_name, y, e->d_name);
+                          } else {
+                              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                                  "TEXT 10 %d 1 \"FILE %s (%ld B)\" 0xCCCCCC\n",
+                                  y, e->d_name, (long)st.st_size);
+                          }
+                          y += 26;
+                      }
+                  }
+                  closedir(d);
+              }
+              a->ui_valid = 1;
+          }
+
+          static void build_clock_ui(app_t *a, int refresh) {
+              char *out = a->ui;
+              int pos = 0;
+              char sw[512];
+              snprintf(sw, sizeof(sw), "%s/sw", a->dir);
+              long s = 0, e = 0;
+              FILE *f = fopen(sw, "r");
+              if (f) {
+                  if (fscanf(f, "%ld %ld", &s, &e) != 2) { s = 0; e = 0; }  /* FIXED */
+                  fclose(f);
+              }
+              time_t now = time(NULL);
+              struct tm *tm = localtime(&now);
+              char tstr[32], dstr2[64];
+              strftime(tstr, sizeof(tstr), "%H:%M:%S", tm);
+              strftime(dstr2, sizeof(dstr2), "%A, %B %d, %Y", tm);
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BG 0x0A0A1E\n"
+                  "TEXT 10 10 2 \"Clock\" 0x00D4FF\n"
+                  "RECT 50 50 600 100 0x2D3436\n"
+                  "TEXT 150 70 6 \"%s\" 0x00FF00\n"
+                  "TEXT 200 120 2 \"%s\" 0xAAAAAA\n"
+                  "TEXT 10 180 2 \"Stopwatch\" 0xFDCB6E\n", tstr, dstr2);
+              if (s > 0) {
+                  long el = now - s;
+                  pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                      "TEXT 50 210 4 \"Running: %ldm %lds\" 0x00FF00\n"
+                      "BTN stop 10 260 120 36 \"Stop\" 0xD63031\n", el/60, el%60);
+              } else {
+                  if (e > 0) {
+                      pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                          "TEXT 50 210 4 \"Stopped: %ldm %lds\" 0xFDCB6E\n", e/60, e%60);
+                  } else {
+                      pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                          "TEXT 50 210 4 \"0m 0s\" 0x888888\n");
+                  }
+                  pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                      "BTN start 10 260 120 36 \"Start\" 0x00B894\n");
+              }
+              pos += snprintf(out + pos, sizeof(a->ui) - pos,
+                  "BTN reset 140 260 120 36 \"Reset\" 0x2D3436\n");
+              a->ui_valid = 1;
+          }
+
+          static void build_app_ui(app_t *a, int refresh) {
+              if (a->ui_valid && !refresh) return;
+              if (strcmp(a->name, "Terminal") == 0) build_terminal_ui(a, refresh);
+              else if (strcmp(a->name, "Monitor") == 0) build_monitor_ui(a, refresh);
+              else if (strcmp(a->name, "Settings") == 0) build_settings_ui(a, refresh);
+              else if (strcmp(a->name, "Calc") == 0) build_calc_ui(a, refresh);
+              else if (strcmp(a->name, "Files") == 0) build_files_ui(a, refresh);
+              else if (strcmp(a->name, "Clock") == 0) build_clock_ui(a, refresh);
+              else {
+                  snprintf(a->ui, sizeof(a->ui),
+                      "BG 0x0A0A1E\nTEXT 10 10 2 \"%s\" 0x00D4FF\nTEXT 10 50 1 \"(no UI)\" 0xAAAAAA\n",
+                      a->name);
+                  a->ui_valid = 1;
+              }
+          }
+
+          static void handle_terminal_click(app_t *a, const char *id) {
+              char result[8192];
+              terminal_exec(id, result, sizeof(result));
+              char rpath[512];
+              snprintf(rpath, sizeof(rpath), "%s/result.txt", a->dir);
+              FILE *f = fopen(rpath, "w");
+              if (f) { fputs(result, f); fclose(f); }
+              a->ui_valid = 0;
+          }
+
+          static void handle_files_click(app_t *a, const char *id) {
+              char df[512];
+              snprintf(df, sizeof(df), "%s/dir", a->dir);
+              char cur[512] = "/";
+              FILE *f = fopen(df, "r");
+              if (f) { if (fgets(cur, sizeof(cur), f)) cur[strcspn(cur, "\n")] = 0; fclose(f); }
+
+              char nw[512];
+              if (strcmp(id, "up") == 0) {
+                  char *sl = strrchr(cur, '/');
+                  if (sl && sl != cur) *sl = 0;
+                  else strcpy(cur, "/");
+                  strcpy(nw, cur);
+                  f = fopen(df, "w"); if (f) { fputs(nw, f); fclose(f); }
+              } else if (strcmp(id, "home") == 0) {
+                  f = fopen(df, "w"); if (f) { fputs("/root", f); fclose(f); }
+              } else if (strcmp(id, "root") == 0) {
+                  f = fopen(df, "w"); if (f) { fputs("/", f); fclose(f); }
+              } else if (strcmp(id, "tpk") == 0) {
+                  f = fopen(df, "w"); if (f) { fputs("/tpk", f); fclose(f); }
+              } else if (strncmp(id, "d_", 2) == 0) {
+                  const char *n = id + 2;
+                  if (strcmp(cur, "/") == 0) snprintf(nw, sizeof(nw), "/%s", n);
+                  else snprintf(nw, sizeof(nw), "%s/%s", cur, n);
+                  struct stat st;
+                  if (stat(nw, &st) == 0 && S_ISDIR(st.st_mode)) {
+                      f = fopen(df, "w"); if (f) { fputs(nw, f); fclose(f); }
+                  }
+              }
+              a->ui_valid = 0;
+          }
+
+          static void handle_calc_click(app_t *a, const char *id) {
+              char sf[512];
+              snprintf(sf, sizeof(sf), "%s/state", a->dir);
+              char v[64] = "0";
+              FILE *f = fopen(sf, "r");
+              if (f) { if (fgets(v, sizeof(v), f)) v[strcspn(v, "\n")] = 0; fclose(f); }
+
+              char pf[512], of[512];
+              snprintf(pf, sizeof(pf), "%s/prev", a->dir);
+              snprintf(of, sizeof(of), "%s/op", a->dir);
+
+              if (strcmp(id, "c") == 0) {
+                  f = fopen(sf, "w"); if (f) { fputs("0", f); fclose(f); }
+              } else if (strncmp(id, "d", 1) == 0 && isdigit(id[1])) {
+                  char d = id[1];
+                  char nv[64];
+                  if (strcmp(v, "0") == 0) snprintf(nv, sizeof(nv), "%c", d);
+                  else snprintf(nv, sizeof(nv), "%s%c", v, d);
+                  f = fopen(sf, "w"); if (f) { fputs(nv, f); fclose(f); }
+              } else if (strcmp(id, "add") == 0 || strcmp(id, "sub") == 0 ||
+                         strcmp(id, "mul") == 0 || strcmp(id, "div") == 0) {
+                  f = fopen(pf, "w"); if (f) { fputs(v, f); fclose(f); }
+                  f = fopen(of, "w"); if (f) { fputs(id, f); fclose(f); }
+                  f = fopen(sf, "w"); if (f) { fputs("0", f); fclose(f); }
+              } else if (strcmp(id, "eq") == 0) {
+                  char p[64] = "0", o[64] = "";
+                  f = fopen(pf, "r"); if (f) { if (fgets(p, sizeof(p), f)) p[strcspn(p, "\n")] = 0; fclose(f); }
+                  f = fopen(of, "r"); if (f) { if (fgets(o, sizeof(o), f)) o[strcspn(o, "\n")] = 0; fclose(f); }
+                  long pv = atol(p), vv = atol(v), r = 0;
+                  char rs[64];
+                  if (strcmp(o, "add") == 0) r = pv + vv;
+                  else if (strcmp(o, "sub") == 0) r = pv - vv;
+                  else if (strcmp(o, "mul") == 0) r = pv * vv;
+                  else if (strcmp(o, "div") == 0) r = vv ? pv / vv : 0;
+                  snprintf(rs, sizeof(rs), "%ld", r);
+                  f = fopen(sf, "w"); if (f) { fputs(rs, f); fclose(f); }
+                  unlink(pf); unlink(of);
+              }
+              a->ui_valid = 0;
+          }
+
+          static void handle_settings_click(app_t *a, const char *id) {
+              char hf[512];
+              snprintf(hf, sizeof(hf), "%s/hostname", a->dir);
+              if (strcmp(id, "h1") == 0 || strcmp(id, "h2") == 0 || strcmp(id, "h3") == 0) {
+                  const char *name = (strcmp(id, "h1") == 0) ? "zenos" :
+                                     (strcmp(id, "h2") == 0) ? "device" : "phone";
+                  FILE *f = fopen(hf, "w");
+                  if (f) { fputs(name, f); fclose(f); }
+              } else if (strcmp(id, "info") == 0 || strcmp(id, "date") == 0) {
+                  char out[2048];
+                  if (strcmp(id, "info") == 0) {
+                      struct utsname uts_info;
+                      uname(&uts_info);
+                      snprintf(out, sizeof(out), "%s %s\n%s\n%s\n%s",
+                          uts_info.sysname, uts_info.nodename, uts_info.release, uts_info.version, uts_info.machine);
+                  } else {
+                      time_t t = time(NULL);
+                      struct tm *tm = localtime(&t);
+                      strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S %Z\n", tm);
+                  }
+                  char of[512];
+                  snprintf(of, sizeof(of), "%s/out.txt", a->dir);
+                  FILE *f = fopen(of, "w");
+                  if (f) { fputs(out, f); fclose(f); }
+              }
+              a->ui_valid = 0;
+          }
+
+          static void handle_clock_click(app_t *a, const char *id) {
+              char sf[512];
+              snprintf(sf, sizeof(sf), "%s/sw", a->dir);
+              long s = 0, e = 0;
+              FILE *f = fopen(sf, "r");
+              if (f) {
+                  if (fscanf(f, "%ld %ld", &s, &e) != 2) { s = 0; e = 0; }  /* FIXED */
+                  fclose(f);
+              }
+              time_t now = time(NULL);
+              if (strcmp(id, "start") == 0) {
+                  f = fopen(sf, "w"); if (f) { fprintf(f, "%ld 0", (long)now); fclose(f); }
+              } else if (strcmp(id, "stop") == 0) {
+                  f = fopen(sf, "w"); if (f) { fprintf(f, "0 %ld", (long)(now - s)); fclose(f); }
+              } else if (strcmp(id, "reset") == 0) {
+                  f = fopen(sf, "w"); if (f) { fputs("0 0", f); fclose(f); }
+              }
+              a->ui_valid = 0;
+          }
+
+          static void extract_all_tpks(void) {
+              mkdir(APPS_DIR, 0755);
+              DIR *d = opendir(TPK_DIR);
+              if (!d) return;
+              struct dirent *e;
+              n_apps = 0;
+              uint32_t P[][2] = {
+                  {0x6C5CE7,0xA29BFE},{0x00B894,0x55EFC4},{0xE17055,0xFAB1A0},
+                  {0x0984E3,0x74B9FF},{0xFD79A8,0xFDCB6E},{0x00CEC9,0x81ECEC},
+                  {0xE84393,0xFD79A8},{0x2D3436,0x636E72},{0xD63031,0xFF7675},
+                  {0x00B894,0x00CEC9},{0xFDCB6E,0xE17055},{0x0984E3,0x6C5CE7}
+              };
+              while ((e = readdir(d)) && n_apps < MAX_APPS) {
+                  char *dot = strstr(e->d_name, ".tpk");
+                  if (!dot) continue;
+                  char name[64];
+                  strncpy(name, e->d_name, dot - e->d_name);
+                  name[dot - e->d_name] = 0;
+                  char dir[256], tpk[256];
+                  snprintf(dir, sizeof(dir), APPS_DIR "/%s", name);
+                  snprintf(tpk, sizeof(tpk), TPK_DIR "/%s", e->d_name);
+                  mkdir(dir, 0755);
+
+                  strncpy(apps[n_apps].name, name, 63);
+                  strncpy(apps[n_apps].dir, dir, 255);
+                  apps[n_apps].icon_letter = name[0];
+                  if (apps[n_apps].icon_letter >= 'a' && apps[n_apps].icon_letter <= 'z')
+                      apps[n_apps].icon_letter -= 32;
+                  apps[n_apps].color1 = P[n_apps % 12][0];
+                  apps[n_apps].color2 = P[n_apps % 12][1];
+                  apps[n_apps].ui_valid = 0;
+                  n_apps++;
+                  klog("app: %s", name);
+              }
+              closedir(d);
+          }
+
+          static void draw_status_bar(void) {
+              fill_rect(0, 0, W, 40, 0x0D0D22);
+              time_t now = time(NULL);
+              struct tm *t = localtime(&now);
+              char ts[32];
+              strftime(ts, sizeof(ts), "%H:%M:%S", t);
+              dstr(20, 12, ts, 2, 0xFFFFFFFF);
+              dstr(W - 100, 12, "zenOS", 2, 0x00D4FF);
+              if (n_inputs > 0) {
+                  uint32_t c = touch_down ? 0xFF0000 : 0x00FF00;
+                  for (int j = -6; j <= 6; j++)
+                      for (int i = -6; i <= 6; i++)
+                          if (i*i + j*j <= 36)
+                              px(W - 130 + i, 20 + j, c);
+              }
+          }
+
+          #define NAV_H 56
+          static void draw_nav_bar(void) {
+              int ny = H - NAV_H;
+              fill_rect(0, ny, W, NAV_H, 0x000000);
+              int btn_w = W / 3;
+              int btn_cy = ny + NAV_H / 2;
+              int bx = btn_w / 2, sz = 22;
+              for (int i = 0; i < sz*2; i++) {
+                  int h = i < sz ? i : sz*2 - i;
+                  fill_rect(bx - sz + i, btn_cy - h, 1, h*2 + 1, 0xFFFFFFFF);
+              }
+              int hx = btn_w + btn_w/2, rad = 20;
+              for (int j = -rad; j <= rad; j++)
+                  for (int i = -rad; i <= rad; i++) {
+                      int d = i*i + j*j;
+                      if (d <= rad*rad && d > (rad-5)*(rad-5))
+                          px(hx + i, btn_cy + j, 0xFFFFFFFF);
+                  }
+              int rx = 2*btn_w + btn_w/2, sq = 18;
+              fill_rect(rx - sq, btn_cy - sq, sq*2, 3, 0xFFFFFFFF);
+              fill_rect(rx - sq, btn_cy + sq - 3, sq*2, 3, 0xFFFFFFFF);
+              fill_rect(rx - sq, btn_cy - sq, 3, sq*2, 0xFFFFFFFF);
+              fill_rect(rx + sq - 3, btn_cy - sq, 3, sq*2, 0xFFFFFFFF);
+          }
+
+          static void draw_home(void) {
+              for (int j = 40; j < H - NAV_H; j++) {
+                  int t = (j - 40) * 255 / (H - NAV_H - 40);
+                  uint8_t r = 10 + t * 12 / 255;
+                  uint8_t g = 10 + t * 22 / 255;
+                  uint8_t b = 30 + t * 32 / 255;
+                  fill_rect(0, j, W, 1, 0xFF000000 | (r<<16) | (g<<8) | b);
+              }
+              if (n_apps == 0) {
+                  dstr((W - strw("No Apps", 2))/2, H/2, "No Apps", 2, 0xAAAAAA);
+                  return;
+              }
+              int cols = 4, icon = 90, gx = 30, gy = 40;
+              int tw = cols*icon + (cols-1)*gx;
+              int sx = (W - tw)/2, sy = 90;
+              dstr(sx, sy - 30, "Applications", 2, 0x888888);
+              for (int i = 0; i < n_apps; i++) {
+                  int col = i % cols, row = i / cols;
+                  int ax = sx + col*(icon + gx);
+                  int ay = sy + row*(icon + gy + 30);
+                  for (int j = 0; j < icon; j++) {
+                      uint8_t r = ((apps[i].color1 >> 16) & 0xFF) +
+                                  ((((apps[i].color2 >> 16) & 0xFF) - ((apps[i].color1 >> 16) & 0xFF)) * j / icon);
+                      uint8_t g = ((apps[i].color1 >> 8) & 0xFF) +
+                                  ((((apps[i].color2 >> 8) & 0xFF) - ((apps[i].color1 >> 8) & 0xFF)) * j / icon);
+                      uint8_t b = (apps[i].color1 & 0xFF) +
+                                  (((apps[i].color2 & 0xFF) - (apps[i].color1 & 0xFF)) * j / icon);
+                      fill_rect(ax, ay + j, icon, 1, 0xFF000000 | (r<<16) | (g<<8) | b);
+                  }
+                  int r = icon/5;
+                  for (int j = 0; j < r; j++)
+                      for (int k = 0; k < r; k++)
+                          if (k*k + j*j > r*r) {
+                              px(ax + k, ay + j, 0xFF0A0A1E);
+                              px(ax + icon - 1 - k, ay + j, 0xFF0A0A1E);
+                              px(ax + k, ay + icon - 1 - j, 0xFF0A0A1E);
+                              px(ax + icon - 1 - k, ay + icon - 1 - j, 0xFF0A0A1E);
+                          }
+                  char l[2] = {apps[i].icon_letter, 0};
+                  int sc = icon/32; if (sc < 2) sc = 2;
+                  int tw2 = strw(l, sc);
+                  dstr(ax + (icon - tw2)/2, ay + (icon - 16*sc)/2, l, sc, 0xFFFFFFFF);
+                  char dn[64];
+                  int nw = strw(apps[i].name, 2);
+                  if (nw > icon + 20) { strncpy(dn, apps[i].name, 12); dn[12] = 0; strcat(dn, ".."); }
+                  else strcpy(dn, apps[i].name);
+                  int dw = strw(dn, 2);
+                  dstr(ax + (icon - dw)/2, ay + icon + 8, dn, 2, 0xCCCCCC);
+
+                  if (touch_x >= ax && touch_x <= ax + icon &&
+                      touch_y >= ay && touch_y <= ay + icon) {
+                      rrect(ax - 2, ay - 2, icon + 4, icon + 4, icon/5, 0x00D4FF);
+                      for (int j = 0; j < icon; j++) {
+                          uint8_t r2 = ((apps[i].color1 >> 16) & 0xFF) +
+                                      ((((apps[i].color2 >> 16) & 0xFF) - ((apps[i].color1 >> 16) & 0xFF)) * j / icon);
+                          uint8_t g2 = ((apps[i].color1 >> 8) & 0xFF) +
+                                      ((((apps[i].color2 >> 8) & 0xFF) - ((apps[i].color1 >> 8) & 0xFF)) * j / icon);
+                          uint8_t b2 = (apps[i].color1 & 0xFF) +
+                                      (((apps[i].color2 & 0xFF) - (apps[i].color1 & 0xFF)) * j / icon);
+                          fill_rect(ax, ay + j, icon, 1, 0xFF000000 | (r2<<16) | (g2<<8) | b2);
+                      }
+                      dstr(ax + (icon - tw2)/2, ay + (icon - 16*sc)/2, l, sc, 0xFFFFFFFF);
+                  }
+              }
+          }
+
+          static void draw_app_window(int idx) {
+              app_t *a = &apps[idx];
+              int x = 20, y = 50, width = W - 40, height = H - 50 - NAV_H - 10;
+              rrect(x, y, width, height, 12, 0x1A1A2E);
+              fill_rect(x, y, width, 40, 0x2D3436);
+              int cx = x + width - 36, cy = y + 8;
+              rrect(cx, cy, 24, 24, 6, 0xD63031);
+              dstr(cx + 8, cy + 6, "X", 2, 0xFFFFFFFF);
+              dstr(x + 12, y + 12, a->name, 2, 0xFFFFFFFF);
+
+              build_app_ui(a, 0);
+              parse_ui(a->ui);
+              uint32_t bg = 0x1A1A2E;
+              for (int i = 0; i < n_ui_cmds; i++)
+                  if (strcmp(ui_cmds[i].cmd, "BG") == 0) bg = ui_cmds[i].color;
+              fill_rect(x, y + 40, width, height - 40, bg);
+              for (int i = 0; i < n_ui_cmds; i++) {
+                  ui_cmd_t *c = &ui_cmds[i];
+                  if (strcmp(c->cmd, "RECT") == 0) {
+                      fill_rect(x + c->x, y + 40 + c->y, c->w, c->h, c->color);
+                  } else if (strcmp(c->cmd, "TEXT") == 0) {
+                      dstr(x + c->x, y + 40 + c->y, c->text, c->size, c->color);
+                  } else if (strcmp(c->cmd, "BTN") == 0) {
+                      rrect(x + c->x, y + 40 + c->y, c->w, c->h, 8, c->color);
+                      int tw = strw(c->text, 2);
+                      dstr(x + c->x + (c->w - tw)/2, y + 40 + c->y + (c->h - 16)/2,
+                           c->text, 2, 0xFFFFFFFF);
+                      int lx = touch_x - x, ly = touch_y - y - 40;
+                      if (lx >= c->x && lx <= c->x + c->w && ly >= c->y && ly <= c->y + c->h) {
+                          rrect(x + c->x, y + 40 + c->y, c->w, c->h, 8, 0xFFFFFF);
+                          rrect(x + c->x + 2, y + 40 + c->y + 2, c->w - 4, c->h - 4, 7, c->color);
+                          dstr(x + c->x + (c->w - tw)/2, y + 40 + c->y + (c->h - 16)/2,
+                               c->text, 2, 0xFFFFFFFF);
+                      }
+                  }
+              }
+          }
+
+          static void init_input(void) {
+              n_inputs = 0;
+              sleep(1);
+              for (int i = 0; i < 16 && n_inputs < 16; i++) {
+                  char path[64];
+                  snprintf(path, sizeof(path), "/dev/input/event%d", i);
+                  int fd = open(path, O_RDONLY | O_NONBLOCK);
+                  if (fd < 0) continue;
+
+                  uint8_t abs_bits[(ABS_MAX+7)/8];
+                  uint8_t key_bits[(KEY_MAX+7)/8];
+                  memset(abs_bits, 0, sizeof(abs_bits));
+                  memset(key_bits, 0, sizeof(key_bits));
+                  ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits);
+                  ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+
+                  int has_ax = abs_bits[ABS_X/8] & (1 << (ABS_X%8));
+                  int has_ay = abs_bits[ABS_Y/8] & (1 << (ABS_Y%8));
+
+                  if (has_ax) {
+                      struct input_absinfo abs;
+                      if (ioctl(fd, EVIOCGABS(ABS_X), &abs) == 0) {
+                          abs_x_min = abs.minimum; abs_x_max = abs.maximum;
+                          has_abs_x = 1;
+                      }
+                  }
+                  if (has_ay) {
+                      struct input_absinfo abs;
+                      if (ioctl(fd, EVIOCGABS(ABS_Y), &abs) == 0) {
+                          abs_y_min = abs.minimum; abs_y_max = abs.maximum;
+                          has_abs_y = 1;
+                      }
+                  }
+
+                  input_fds[n_inputs++] = fd;
+                  klog("input: %s", path);
+              }
+              klog("total: %d inputs", n_inputs);
+          }
+
+          static void poll_input(void) {
+              if (n_inputs == 0) return;
+              fd_set rfds; FD_ZERO(&rfds);
+              int max_fd = -1;
+              for (int i = 0; i < n_inputs; i++) {
+                  FD_SET(input_fds[i], &rfds);
+                  if (input_fds[i] > max_fd) max_fd = input_fds[i];
+              }
+              struct timeval tv = {0, 0};
+              if (select(max_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return;
+
+              for (int i = 0; i < n_inputs; i++) {
+                  if (!FD_ISSET(input_fds[i], &rfds)) continue;
+
+                  struct input_event evs[32];
+                  ssize_t r = read(input_fds[i], evs, sizeof(evs));
+                  if (r < (ssize_t)sizeof(struct input_event)) continue;
+                  int n = r / sizeof(struct input_event);
+
+                  for (int j = 0; j < n; j++) {
+                      struct input_event *ev = &evs[j];
+
+                      if (ev->type == EV_ABS) {
+                          if (ev->code == ABS_X) {
+                              int range = abs_x_max - abs_x_min;
+                              int nx;
+                              if (range > 0)
+                                  nx = (ev->value - abs_x_min) * (W - 1) / range;
+                              else
+                                  nx = ev->value * W / 32767;
+                              if (nx < 0) nx = 0;
+                              if (nx >= W) nx = W - 1;
+                              pending_x = nx;
+                          } else if (ev->code == ABS_Y) {
+                              int range = abs_y_max - abs_y_min;
+                              int ny;
+                              if (range > 0)
+                                  ny = (ev->value - abs_y_min) * (H - 1) / range;
+                              else
+                                  ny = ev->value * H / 32767;
+                              if (ny < 0) ny = 0;
+                              if (ny >= H) ny = H - 1;
+                              pending_y = ny;
+                          }
+                      } else if (ev->type == EV_KEY) {
+                          int v = ev->value;
+                          if (v == 2) v = 1;
+                          if (ev->code == BTN_TOUCH || ev->code == BTN_LEFT ||
+                              ev->code == BTN_MOUSE || ev->code == BTN_RIGHT) {
+                              last_touch_down = touch_down;
+                              touch_down = v;
+                              if (v && pending_x >= 0 && pending_y >= 0) {
+                                  touch_x = pending_x;
+                                  touch_y = pending_y;
+                              }
+                          }
+                      } else if (ev->type == EV_REL) {
+                          if (ev->code == REL_X) {
+                              touch_x += ev->value;
+                              if (touch_x < 0) touch_x = 0;
+                              if (touch_x >= W) touch_x = W - 1;
+                          }
+                          if (ev->code == REL_Y) {
+                              touch_y += ev->value;
+                              if (touch_y < 0) touch_y = 0;
+                              if (touch_y >= H) touch_y = H - 1;
+                          }
+                      } else if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
+                          if (pending_x >= 0) touch_x = pending_x;
+                          if (pending_y >= 0) touch_y = pending_y;
+                      }
+                  }
+              }
+          }
+
+          static int handle_nav_click(void) {
+              int ny = H - NAV_H;
+              if (touch_y < ny) return 0;
+              int btn_w = W / 3;
+              if (touch_x < btn_w) {
+                  if (active_app >= 0) active_app = -1;
+              } else if (touch_x < 2*btn_w) {
+                  active_app = -1;
+              } else {
+                  active_app = -1;
+              }
+              return 1;
+          }
+
+          static void handle_touch_down(void) {
+              if (touch_y < 40) return;
+              if (handle_nav_click()) return;
+
+              if (active_app >= 0) {
+                  app_t *a = &apps[active_app];
+                  int x = 20, y = 50, width = W - 40, height = H - 50 - NAV_H - 10;
+                  int lx = touch_x - x, ly = touch_y - y;
+
+                  if (lx >= width - 36 && lx <= width - 12 && ly >= 8 && ly <= 32) {
+                      active_app = -1;
+                      return;
+                  }
+
+                  parse_ui(a->ui);
+                  int wy = ly - 40;
+                  for (int i = 0; i < n_ui_cmds; i++) {
+                      if (strcmp(ui_cmds[i].cmd, "BTN") == 0 &&
+                          lx >= ui_cmds[i].x && lx <= ui_cmds[i].x + ui_cmds[i].w &&
+                          wy >= ui_cmds[i].y && wy <= ui_cmds[i].y + ui_cmds[i].h) {
+                          if (strcmp(a->name, "Terminal") == 0)
+                              handle_terminal_click(a, ui_cmds[i].id);
+                          else if (strcmp(a->name, "Files") == 0)
+                              handle_files_click(a, ui_cmds[i].id);
+                          else if (strcmp(a->name, "Calc") == 0)
+                              handle_calc_click(a, ui_cmds[i].id);
+                          else if (strcmp(a->name, "Settings") == 0)
+                              handle_settings_click(a, ui_cmds[i].id);
+                          else if (strcmp(a->name, "Clock") == 0)
+                              handle_clock_click(a, ui_cmds[i].id);
+                          else if (strcmp(a->name, "Monitor") == 0) {
+                              a->ui_valid = 0;
+                          }
+                          return;
+                      }
+                  }
+              } else {
+                  int cols = 4, icon = 90, gx = 30, gy = 40;
+                  int tw = cols*icon + (cols-1)*gx;
+                  int sx = (W - tw)/2, sy = 90;
+                  for (int i = 0; i < n_apps; i++) {
+                      int col = i % cols, row = i / cols;
+                      int ax = sx + col*(icon + gx);
+                      int ay = sy + row*(icon + gy + 30);
+                      if (touch_x >= ax && touch_x <= ax + icon &&
+                          touch_y >= ay && touch_y <= ay + icon) {
+                          active_app = i;
+                          apps[i].ui_valid = 0;
+                          return;
+                      }
+                  }
+              }
+          }
+
+          static void render(void) {
+              memset(fb_back, 0, fb_size);
+              draw_home();
+              if (active_app >= 0) draw_app_window(active_app);
+              draw_status_bar();
+              draw_nav_bar();
+
+              if (touch_down) {
+                  for (int j = -12; j <= 12; j++)
+                      for (int i = -12; i <= 12; i++) {
+                          int d = i*i + j*j;
+                          if (d <= 144 && d > 100) {
+                              int xx = touch_x + i, yy = touch_y + j;
+                              if (xx >= 0 && xx < W && yy >= 0 && yy < H)
+                                  fb_back[yy * W + xx] = 0x00D4FF;
+                          }
+                      }
+              }
+
+              if (fb_front) memcpy(fb_front, fb_back, fb_size);
+          }
+
+          int main(void) {
+              klog("zenOS HYPER starting");
+              mount("proc", "/proc", "proc", 0, NULL);
+              mount("sysfs", "/sys", "sysfs", 0, NULL);
+              mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+              sleep(2);
+              mkdir("/dev/pts", 0755);
+              mount("devpts", "/dev/pts", "devpts", 0, NULL);
+              mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
+              mount("tmpfs", "/var", "tmpfs", 0, NULL);
+              mkdir(TPK_DIR, 0755);
+              mkdir("/root", 0755);
+              mkdir("/data", 0755);
+
+              if (fork() == 0) {
+                  setsid();
+                  int fd = open("/dev/tty2", O_RDWR);
+                  if (fd < 0) fd = open("/dev/console", O_RDWR);
+                  if (fd >= 0) { ioctl(fd, TIOCSCTTY, 1); dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+                  setenv("PS1", "zenos~# ", 1);
+                  setenv("HOME", "/root", 1);
+                  setenv("PATH", "/bin:/usr/bin", 1);
+                  execl("/bin/busybox", "sh", "-i", NULL);
+                  exit(1);
+              }
+
+              { int tty = open("/dev/tty1", O_RDWR);
+                if (tty >= 0) { ioctl(tty, VT_ACTIVATE, 1); ioctl(tty, VT_WAITACTIVE, 1); ioctl(tty, KDSETMODE, KD_GRAPHICS); close(tty); }
+              }
+
+              sleep(1);
+              int fb_fd = -1;
+              for (int t = 0; t < 15; t++) {
+                  fb_fd = open("/dev/fb0", O_RDWR);
+                  if (fb_fd >= 0) break;
+                  sleep(1);
+              }
+              if (fb_fd < 0) { klog("no fb"); while (1) { int s; while (waitpid(-1, &s, WNOHANG) > 0); sleep(5); } }
+              struct fb_var_screeninfo vi;
+              ioctl(fb_fd, FBIOGET_VSCREENINFO, &vi);
+              W = vi.xres; H = vi.yres; fb_size = W * H * 4;
+              fb_front = mmap(0, fb_size, PROT_READ|PROT_WRITE, MAP_SHARED, fb_fd, 0);
+              if (fb_front == MAP_FAILED) return 1;
+              fb_back = malloc(fb_size);
+              memset(fb_back, 0, fb_size);
+
+              init_input();
+              extract_all_tpks();
+              klog("ready: %dx%d, %d inputs, %d apps", W, H, n_inputs, n_apps);
+
+              while (1) {
+                  poll_input();
+                  int new_touch = touch_down && !last_touch_down;
+                  if (new_touch) handle_touch_down();
+                  last_touch_down = touch_down;
+                  render();
+                  usleep(8333);
+                  int s; while (waitpid(-1, &s, WNOHANG) > 0);
+              }
+              return 0;
+          }
+          CEOF
+          aarch64-linux-gnu-gcc -O3 -march=armv8-a -mtune=cortex-a57 -static -o zenos-rootfs/init zenos-rootfs/init.c -lm
+          chmod +x zenos-rootfs/init
+          ls -lh zenos-rootfs/init
+
+      - name: Create TPK placeholders
+        run: |
+          cd zenos-rootfs
+          mkdir -p dev proc sys tmp tpk dev/input usr/bin tpk_build root data var/apps
+          for cmd in sh ls cat mkdir mount chmod unzip sleep echo clear date ps free df uname hostname wc head tail awk grep dirname basename top stat mkfifo; do
+            ln -sf busybox bin/$cmd 2>/dev/null || true
+          done
+          
+          for app in Terminal Files Monitor Calc Settings Clock; do
+            mkdir -p tpk_build/$app/shared/res
+            cat > tpk_build/$app/shared/res/entry.sh << TPK
+          #!/bin/sh
+          echo "BG 0x0A0A1E"
+          echo "TEXT 10 10 2 \"$app\" 0x00D4FF"
+          TPK
+            chmod +x tpk_build/$app/shared/res/entry.sh
+            (cd tpk_build/$app && zip -qr ../../tpk/$app.tpk .)
+          done
+          rm -rf tpk_build
+          find . | cpio -H newc -o > ../initramfs.cpio
+          gzip -9 < ../initramfs.cpio > ../initramfs.img
+          cd ..
+
+      - name: Create disk
+        run: |
+          dd if=/dev/zero of=zenos.img bs=1M count=100
+          mkfs.ext4 -F -L zenOS zenos.img
+          mkdir -p mnt
+          sudo mount -o loop zenos.img mnt
+          sudo mkdir -p mnt/boot
+          sudo cp kernel.img mnt/boot/
+          sudo cp initramfs.img mnt/boot/
+          sudo sync && sudo umount mnt
+          gzip -kf zenos.img
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenos-arm64
+          path: |
+            zenos.img.gz
+            kernel.img
+            initramfs.img
